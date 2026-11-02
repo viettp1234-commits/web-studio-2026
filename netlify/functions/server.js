@@ -6,6 +6,7 @@ const TARGET_URL = 'https://lightvisual.studio';
 const ADMIN_PASS = 'admin123';
 const BRAND_NAME = 'AI Studio Pro';
 const SECRET_KEY = 'khoa-bao-mat-proxy-2026-queue-vip';
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 phút không thao tác sẽ tự nhường lượt
 
 const DB_FILE = '/tmp/database.json';
 let db = {
@@ -13,8 +14,8 @@ let db = {
     masterCsrfToken: '',
     hideHistoryTabs: false,
     lastCreated: null,
-    activeUser: null, // Tài khoản đang chiếm luồng chính
-    queue: [],        // Danh sách tài khoản đang xếp hàng theo thứ tự ai nhập trước đứng trước
+    activeUser: null,
+    queue: [],
     users: {},
     kickedUsers: {}
 };
@@ -33,16 +34,25 @@ function loadDB() {
         } catch (e) {}
     }
 }
+
 function saveDB() {
     try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8'); } catch (e) {}
 }
 
-// Hàm điều phối Hàng chờ 1 Luồng (Tự động đẩy người tiếp theo vào khi người cũ hết giờ/thoát)
+// Kiểm tra xem request có phải là file tĩnh (.js, .css, ảnh, font...) không
+function isStaticAsset(path) {
+    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|mp4|webm|json|map|wasm)$/i.test(path) ||
+           path.startsWith('/assets/') ||
+           path.startsWith('/_next/') ||
+           path.startsWith('/static/');
+}
+
+// Hàm điều phối Hàng chờ 1 Luồng (Kiểm tra hết giờ + Treo máy 10 phút)
 function syncQueueEngine() {
     const now = Date.now();
     let changed = false;
 
-    // 1. Kiểm tra người đang dùng luồng chính xem còn hạn hay đã bị đá/hết giờ
+    // 1. Kiểm tra người đang dùng luồng chính
     if (db.activeUser) {
         const u = db.users[db.activeUser];
         if (!u || db.kickedUsers[db.activeUser]) {
@@ -53,8 +63,15 @@ function syncQueueEngine() {
                 u.firstLoginAt = now;
                 changed = true;
             }
+            if (!u.lastInteractionAt) {
+                u.lastInteractionAt = now;
+                changed = true;
+            }
             const expireTime = u.firstLoginAt + u.durationMinutes * 60000;
-            if (now >= expireTime) {
+            const isIdleTimeout = (now - u.lastInteractionAt) >= IDLE_TIMEOUT_MS;
+
+            // Đá ra nếu hết tổng thời gian HOẶC treo máy 10 phút không thao tác
+            if (now >= expireTime || isIdleTimeout) {
                 u.isOnline = false;
                 db.activeUser = null;
                 changed = true;
@@ -62,7 +79,7 @@ function syncQueueEngine() {
         }
     }
 
-    // 2. Làm sạch danh sách hàng chờ (bỏ các nick đã bị xóa hoặc đã hết giờ từ trước)
+    // 2. Làm sạch danh sách hàng chờ
     const cleanQueue = [];
     for (const qUser of db.queue) {
         const u = db.users[qUser];
@@ -82,17 +99,16 @@ function syncQueueEngine() {
     }
     db.queue = cleanQueue;
 
-    // 3. Nếu luồng chính đang trống và có người trong hàng chờ -> Đẩy người #1 vào làm việc ngay!
+    // 3. Nếu luồng chính trống và có người đợi -> Đẩy người #1 vào ngay
     if (!db.activeUser && db.queue.length > 0) {
         const nextUser = db.queue.shift();
         const u = db.users[nextUser];
         if (u) {
             db.activeUser = nextUser;
-            if (!u.firstLoginAt) {
-                u.firstLoginAt = now; // Bắt đầu tính giây từ lúc thực sự được vào Studio!
-            }
+            if (!u.firstLoginAt) u.firstLoginAt = now;
             u.isOnline = true;
             u.lastActiveAt = now;
+            u.lastInteractionAt = now;
             changed = true;
         }
     }
@@ -100,14 +116,12 @@ function syncQueueEngine() {
     if (changed) saveDB();
 }
 
-// Tính thời gian còn lại (giây) của một tài khoản
 function getRemainSeconds(u, now = Date.now()) {
     if (!u) return 0;
     if (!u.firstLoginAt) return u.durationMinutes * 60;
     return Math.max(0, Math.floor((u.firstLoginAt + u.durationMinutes * 60000 - now) / 1000));
 }
 
-// Tính tổng số giây phải chờ của người ở vị trí index trong queue
 function getEstimatedWaitSeconds(queueIndex) {
     const now = Date.now();
     let waitSec = 0;
@@ -192,26 +206,84 @@ function formatTimeVN(sec) {
     return `${m} phút ${s < 10 ? '0' : ''}${s} giây`;
 }
 
-exports.handler = async (event) => {
-    loadDB();
-    syncQueueEngine();
+// Hàm khôi phục thông tin user nếu Netlify khởi tạo instance mới
+function ensureUserFromSession(session, userAgent, clientIp) {
+    const username = session.username;
+    if (!db.users[username]) {
+        db.users[username] = {
+            password: '(Đã mã hóa)',
+            durationMinutes: session.durationMinutes || 60,
+            maxQuota: session.maxQuota || 0,
+            usedQuota: session.usedQuota || 0,
+            firstLoginAt: session.firstLoginAt || null,
+            lastActiveAt: Date.now(),
+            lastInteractionAt: Date.now(),
+            isOnline: true,
+            device: getDeviceName(userAgent),
+            ip: clientIp
+        };
+    }
+    // Nếu instance mới hoàn toàn trống luồng chính và user này đã kích hoạt giờ chơi -> Gán lại luồng chính
+    if (!db.activeUser && db.queue.length === 0 && db.users[username].firstLoginAt) {
+        db.activeUser = username;
+    }
+    return db.users[username];
+}
 
+exports.handler = async (event) => {
     const reqPath = event.path || '/';
     const method = event.httpMethod || 'GET';
     const query = event.queryStringParameters || {};
-    const cookies = parseCookies(event.headers.cookie || event.headers.Cookie);
-    const bodyText = event.isBase64Encoded ? Buffer.from(event.body || '', 'base64').toString('utf8') : (event.body || '');
-    const clientIp = (event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'Không rõ IP').split(',')[0].trim();
     const userAgent = event.headers['user-agent'] || '';
 
     // ==========================================
-    // 1. TRANG ĐĂNG NHẬP & XẾP HÀNG (HIỆN TRẠNG THÁI LUỒNG TRỰC TIẾP)
+    // 0. CHO PHÉP FILE TĨNH (.JS, .CSS, ẢNH...) ĐI THẲNG QUA PROXY ĐỂ KHÔNG BỊ ĐEN MÀN HÌNH
+    // ==========================================
+    if (isStaticAsset(reqPath)) {
+        loadDB();
+        const queryStr = event.rawQuery ? `?${event.rawQuery}` : '';
+        const targetFullUrl = `${TARGET_URL}${reqPath}${queryStr}`;
+        try {
+            const response = await fetch(targetFullUrl, {
+                method,
+                headers: {
+                    'Cookie': db.masterCookie,
+                    'Origin': TARGET_URL,
+                    'Referer': `${TARGET_URL}/`,
+                    'User-Agent': userAgent || 'Mozilla/5.0',
+                    'Accept': event.headers['accept'] || '*/*'
+                }
+            });
+            const contentType = response.headers.get('content-type') || 'application/octet-stream';
+            const arrayBuffer = await response.arrayBuffer();
+            return {
+                statusCode: response.status,
+                headers: {
+                    'content-type': contentType,
+                    'cache-control': 'public, max-age=3600'
+                },
+                body: Buffer.from(arrayBuffer).toString('base64'),
+                isBase64Encoded: true
+            };
+        } catch (err) {
+            return { statusCode: 502, body: '' };
+        }
+    }
+
+    loadDB();
+    syncQueueEngine();
+
+    const cookies = parseCookies(event.headers.cookie || event.headers.Cookie);
+    const bodyText = event.isBase64Encoded ? Buffer.from(event.body || '', 'base64').toString('utf8') : (event.body || '');
+    const clientIp = (event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'Không rõ IP').split(',')[0].trim();
+
+    // ==========================================
+    // 1. TRANG ĐĂNG NHẬP & XẾP HÀNG
     // ==========================================
     if (reqPath === '/sub-login' && method === 'GET') {
         const errorMsg = query.err || '';
         const isBusy = Boolean(db.activeUser);
         const activeRemain = isBusy ? getRemainSeconds(db.users[db.activeUser]) : 0;
-        const totalWaitSec = getEstimatedWaitSeconds(db.queue.length);
 
         const liveStatusBanner = isBusy
             ? `<div style="background:rgba(245,158,11,0.12);border:1px solid #f59e0b;padding:12px;border-radius:10px;margin-bottom:16px;font-size:13px;line-height:1.6;">
@@ -236,7 +308,7 @@ exports.handler = async (event) => {
                     <input type="password" name="password" placeholder="Nhập Mật khẩu" required />
                     <button type="submit">${isBusy ? '⏳ Đăng Nhập Để Xếp Hàng Chờ' : '🚀 Vào Studio Ngay'}</button>
                 </form>
-                <div class="note">Ai nhập tài khoản trước sẽ được xếp vào trước. Khi đang trong hàng chờ, số phút của bạn được giữ nguyên 100%.</div>
+                <div class="note">Ai nhập tài khoản trước sẽ được xếp vào trước. Nếu người đang dùng treo máy 10 phút không thao tác, hệ thống sẽ tự động nhường lượt cho người #1.</div>
             </div></body></html>`
         };
     }
@@ -285,7 +357,6 @@ exports.handler = async (event) => {
             }
         }
 
-        // Kiểm tra nếu tài khoản đã từng kích hoạt trước đó và đã hết sạch thời gian
         if (user.firstLoginAt && (now >= user.firstLoginAt + user.durationMinutes * 60000)) {
             saveDB();
             return {
@@ -297,15 +368,14 @@ exports.handler = async (event) => {
         user.device = getDeviceName(userAgent);
         user.ip = clientIp;
         user.lastActiveAt = now;
+        user.lastInteractionAt = now;
 
-        // XỬ LÝ LUỒNG CHÍNH HOẶC ĐƯA VÀO HÀNG CHỜ (FIFO)
         if (!db.activeUser || db.activeUser === username) {
             db.activeUser = username;
-            if (!user.firstLoginAt) user.firstLoginAt = now; // Bắt đầu tính giây!
+            if (!user.firstLoginAt) user.firstLoginAt = now;
             user.isOnline = true;
             db.queue = db.queue.filter(u => u !== username);
         } else {
-            // Đang có người khác dùng -> Xếp vào hàng chờ nếu chưa có trong hàng chờ
             if (!db.queue.includes(username)) {
                 db.queue.push(username);
                 user.queuedAt = now;
@@ -340,7 +410,6 @@ exports.handler = async (event) => {
         if (session) {
             const uName = session.username;
             if (db.users[uName]) db.users[uName].isOnline = false;
-            // Nếu người đang dùng hoặc đang xếp hàng bấm Thoát -> Nhường luồng ngay cho người kế tiếp!
             if (db.activeUser === uName) {
                 db.activeUser = null;
             }
@@ -351,6 +420,7 @@ exports.handler = async (event) => {
 
         let msg = 'Bạn đã thoát khỏi phiên/hàng chờ. Nếu tài khoản còn thời gian, bạn có thể đăng nhập lại sau!';
         if (query.reason === 'timeout') msg = 'Tài khoản của bạn đã hết thời gian sử dụng!';
+        if (query.reason === 'idle') msg = 'Bạn đã treo máy quá 10 phút không thao tác nên hệ thống tự động nhường lượt cho người tiếp theo!';
         if (query.reason === 'kicked') msg = 'Tài khoản của bạn đã bị Admin xóa hoặc đá khỏi hệ thống!';
 
         return {
@@ -363,7 +433,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 2. GIAO DIỆN PHÒNG CHỜ VIP (KHI ĐANG CÓ NGƯỜI DÙNG LUỒNG CHÍNH)
+    // 2. GIAO DIỆN PHÒNG CHỜ VIP
     // ==========================================
     if (reqPath === '/waiting-room') {
         const session = verifyToken(cookies.sub_token);
@@ -374,18 +444,19 @@ exports.handler = async (event) => {
             return { statusCode: 302, headers: { Location: '/sub-logout?reason=kicked' } };
         }
 
-        // Nếu đã tới lượt -> Chuyển thẳng vào Studio!
+        ensureUserFromSession(session, userAgent, clientIp);
+
         if (db.activeUser === username) {
             return { statusCode: 302, headers: { Location: '/' } };
         }
 
-        // Đảm bảo user nằm trong hàng chờ
         if (!db.queue.includes(username)) {
             if (!db.activeUser) {
                 db.activeUser = username;
                 if (db.users[username] && !db.users[username].firstLoginAt) {
                     db.users[username].firstLoginAt = Date.now();
                 }
+                db.users[username].lastInteractionAt = Date.now();
                 saveDB();
                 return { statusCode: 302, headers: { Location: '/' } };
             }
@@ -435,7 +506,7 @@ exports.handler = async (event) => {
                     <div class="info-row"><span>👥 Tổng số người trong hàng chờ:</span><b id="total-q">${db.queue.length} người</b></div>
 
                     <p style="color:#71717a;font-size:12.5px;margin-top:16px;line-height:1.5;">
-                        💡 <b>Mẹo:</b> Vui lòng <b>giữ nguyên tab này</b>. Nếu người phía trước bấm Thoát sớm hơn dự kiến, bạn sẽ được chuyển thẳng vào Studio ngay lập tức!
+                        💡 <b>Mẹo:</b> Vui lòng <b>giữ nguyên tab này</b>. Nếu người phía trước bấm Thoát hoặc treo máy 10 phút, bạn sẽ được chuyển thẳng vào Studio ngay lập tức!
                     </p>
                     <a href="/sub-logout" class="btn-out">Rời khỏi hàng chờ</a>
                 </div>
@@ -453,7 +524,6 @@ exports.handler = async (event) => {
                         return m + ' phút ' + (s < 10 ? '0' : '') + s + ' giây';
                     }
 
-                    // Đếm ngược mượt mà mỗi giây
                     setInterval(() => {
                         if (waitSec > 0) waitSec--;
                         if (activeSec > 0) activeSec--;
@@ -461,7 +531,6 @@ exports.handler = async (event) => {
                         document.getElementById('active-val').textContent = fmt(activeSec);
                     }, 1000);
 
-                    // Kiểm tra lượt mỗi 3 giây -> Tới lượt là tự nhảy vào Studio luôn!
                     setInterval(() => {
                         fetch('/sub-status').then(r => r.json()).then(data => {
                             if (!data.valid) {
@@ -486,7 +555,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 3. API ĐỒNG BỘ TRẠNG THÁI NGẦM CHO CẢ PHÒNG CHỜ & STUDIO
+    // 3. API ĐỒNG BỘ TRẠNG THÁI NGẦM (/sub-status)
     // ==========================================
     if (reqPath === '/sub-status') {
         const session = verifyToken(cookies.sub_token);
@@ -510,28 +579,19 @@ exports.handler = async (event) => {
             };
         }
 
-        if (!db.users[username]) {
-            db.users[username] = {
-                password: '(Đã mã hóa)',
-                durationMinutes: session.durationMinutes || 60,
-                maxQuota: session.maxQuota || 0,
-                usedQuota: session.usedQuota || 0,
-                firstLoginAt: session.firstLoginAt || null,
-                isOnline: true,
-                device: getDeviceName(userAgent),
-                ip: clientIp
-            };
-        }
-
-        const user = db.users[username];
+        const user = ensureUserFromSession(session, userAgent, clientIp);
         user.isOnline = true;
         user.lastActiveAt = Date.now();
         user.device = getDeviceName(userAgent);
         user.ip = clientIp;
 
+        // Cập nhật thao tác thật của người dùng nếu có cờ active=1 hoặc increment
+        if (query.active === '1' || query.action === 'increment') {
+            user.lastInteractionAt = Date.now();
+        }
+
         syncQueueEngine();
 
-        // Trường hợp 1: Đang là người dùng chính trong Studio
         if (db.activeUser === username) {
             const remainSec = getRemainSeconds(user);
             if (remainSec <= 0) {
@@ -579,7 +639,6 @@ exports.handler = async (event) => {
             };
         }
 
-        // Trường hợp 2: Đang ở trong hàng chờ
         if (!db.queue.includes(username)) {
             if (user.firstLoginAt && getRemainSeconds(user) <= 0) {
                 return { statusCode: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ valid: false, reason: 'timeout' }) };
@@ -612,7 +671,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 4. TRANG QUẢN TRỊ ADMIN (QUẢN LÝ LUỒNG CHÍNH & DANH SÁCH HÀNG CHỜ)
+    // 4. TRANG QUẢN TRỊ ADMIN
     // ==========================================
     if (reqPath.startsWith('/my-admin')) {
         if (query.pass !== ADMIN_PASS) {
@@ -652,7 +711,6 @@ exports.handler = async (event) => {
             return { statusCode: 302, headers: { Location: `/my-admin?pass=${ADMIN_PASS}` } };
         }
 
-        // Nút ưu tiên đẩy 1 người trong hàng chờ vào thẳng luồng chính
         if (reqPath === '/my-admin/promote') {
             const targetUser = query.user;
             if (targetUser && db.users[targetUser]) {
@@ -664,6 +722,7 @@ exports.handler = async (event) => {
                 if (!db.users[targetUser].firstLoginAt) {
                     db.users[targetUser].firstLoginAt = Date.now();
                 }
+                db.users[targetUser].lastInteractionAt = Date.now();
                 saveDB();
             }
             return { statusCode: 302, headers: { Location: `/my-admin?pass=${ADMIN_PASS}` } };
@@ -822,12 +881,14 @@ exports.handler = async (event) => {
         return { statusCode: 302, headers: { Location: '/sub-logout?reason=kicked' } };
     }
 
-    // Nếu người này chưa tới lượt (không phải activeUser) -> Đưa sang Phòng chờ!
+    // Khôi phục thông tin user nếu Netlify đổi sang instance mới
+    const currentUser = ensureUserFromSession(session, userAgent, clientIp);
+    currentUser.lastInteractionAt = Date.now();
+
     if (db.activeUser !== username) {
         return { statusCode: 302, headers: { Location: '/waiting-room' } };
     }
 
-    const currentUser = db.users[username];
     if (!currentUser || getRemainSeconds(currentUser) <= 0) {
         db.activeUser = null;
         syncQueueEngine();
@@ -880,7 +941,9 @@ exports.handler = async (event) => {
 
         if (contentType.includes('text/html')) {
             let html = await response.text();
-            html = html.replace(/lightvisual\.studio/gi, BRAND_NAME).replace(/lightvisual/gi, BRAND_NAME);
+            // Chỉ đổi thẻ <title>, KHÔNG replace toàn bộ chuỗi HTML để tránh làm hỏng link script/JSON của web gốc
+            html = html.replace(/<title>.*?<\/title>/i, `<title>${BRAND_NAME}</title>`);
+
             const remainSec = getRemainSeconds(currentUser);
             const usedQ = currentUser.usedQuota || 0;
             const maxQ = currentUser.maxQuota || 0;
@@ -913,9 +976,21 @@ exports.handler = async (event) => {
                     let sec = ${remainSec};
                     let usedQuota = ${usedQ};
                     let maxQuota = ${maxQ};
+                    let hasInteracted = false;
+                    let idleSeconds = 0;
+                    const MAX_IDLE_SECONDS = 600; // 10 phút không thao tác chuột/phím sẽ tự nhường lượt
+
                     const tEl = document.getElementById('time-left-val');
                     const qEl = document.getElementById('quota-val');
                     const qCountEl = document.getElementById('queue-count-val');
+
+                    // Ghi nhận thao tác chuột/bàn phím để chống treo máy (AFK)
+                    ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'].forEach(evt => {
+                        window.addEventListener(evt, () => {
+                            hasInteracted = true;
+                            idleSeconds = 0;
+                        }, { passive: true });
+                    });
 
                     function renderQuota() {
                         if (!qEl) return;
@@ -929,8 +1004,14 @@ exports.handler = async (event) => {
 
                     setInterval(() => {
                         sec--;
+                        idleSeconds++;
                         if (sec <= 0) {
                             window.location.href = '/sub-logout?reason=timeout';
+                            return;
+                        }
+                        if (idleSeconds >= MAX_IDLE_SECONDS) {
+                            window.location.href = '/sub-logout?reason=idle';
+                            return;
                         }
                         if (tEl && sec >= 0) {
                             const h = Math.floor(sec / 3600);
@@ -942,7 +1023,9 @@ exports.handler = async (event) => {
 
                     const origFetch = window.fetch;
                     setInterval(() => {
-                        origFetch('/sub-status').then(r => r.json()).then(data => {
+                        const activeFlag = hasInteracted ? '?active=1' : '';
+                        hasInteracted = false;
+                        origFetch('/sub-status' + activeFlag).then(r => r.json()).then(data => {
                             if (!data.valid) {
                                 window.location.href = '/sub-logout?reason=' + (data.reason || 'kicked');
                             } else if (data.status === 'queued') {
@@ -998,13 +1081,14 @@ exports.handler = async (event) => {
 
                     function c() {
                         document.querySelectorAll('a, button, span, div').forEach(el => {
+                            if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar')) return;
                             const txt = (el.textContent || '').trim();
                             if (!txt || txt.length > 45) return;
                             if (el.children.length === 0 && (txt.toLowerCase() === 'lightvisual' || txt.toLowerCase() === '.studio')) {
                                 el.textContent = txt.toLowerCase() === 'lightvisual' ? '${BRAND_NAME}' : '';
                             }
                             if (el.children.length === 0 && /^[0-9\\.]+đ$/i.test(txt)) {
-                                const p = el.closest('button, a, div');
+                                const p = el.closest('button, a');
                                 if (p) p.style.display = 'none';
                                 el.style.display = 'none';
                             }
