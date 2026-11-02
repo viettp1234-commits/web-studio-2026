@@ -73,6 +73,8 @@ function mergeIntoDB(incoming = {}) {
             if (v) {
                 db.kickedUsers[k] = true;
                 delete db.users[k];
+                if (db.activeUser === k) db.activeUser = null;
+                db.queue = db.queue.filter(u => u !== k);
             }
         }
     }
@@ -1740,8 +1742,10 @@ exports.handler = async (event) => {
                         Object.keys(latestData.kickedUsers).forEach(k => delete mergedUsers[k]);
                         latestData.users = mergedUsers;
 
-                        if (Array.isArray(srv.usersList) && srv.usersList.length > 0) {
-                            latestData.usersList = sortUsersListFixed(srv.usersList);
+                        if (Array.isArray(srv.usersList)) {
+                            latestData.usersList = sortUsersListFixed(
+                                srv.usersList.filter(u => !(latestData.kickedUsers && latestData.kickedUsers[u.username]))
+                            );
                         }
 
                         latestData.chatUsers = { ...(latestData.chatUsers || {}), ...(srv.chatUsers || {}) };
@@ -1813,11 +1817,26 @@ exports.handler = async (event) => {
                                 '<td>' +
                                     '<button type="button" onclick="navigator.clipboard.writeText(\\'' + copyStr + '\\');this.textContent=\\'Đã Copy!\\';" style="padding:6px 10px;font-size:12px;margin-right:4px;background:#3b82f6;color:#fff;">Copy</button>' +
                                     (u.statusType !== 'active' ? '<a href="/my-admin/promote?pass=' + PASS + '&user=' + u.username + '" style="background:#22c55e;color:#000;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:bold;text-decoration:none;margin-right:4px;">⚡ Cho vào ngay</a>' : '') +
-                                    '<a href="/my-admin/delete?pass=' + PASS + '&user=' + u.username + '" style="background:#ef4444;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:bold;text-decoration:none;">🚫 Xóa / Đá</a>' +
+                                    '<button type="button" onclick="window.__kickUser(\\'' + u.username + '\\')" style="background:#ef4444;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:bold;border:none;cursor:pointer;">🚫 Xóa / Đá</button>' +
                                 '</td>' +
                             '</tr>';
                         }).join('');
                     }
+
+                    window.__kickUser = function(uName) {
+                        if (!uName) return;
+                        latestData.kickedUsers = latestData.kickedUsers || {};
+                        latestData.kickedUsers[uName] = true;
+                        if (latestData.users) delete latestData.users[uName];
+                        if (latestData.activeUser === uName) latestData.activeUser = null;
+                        latestData.usersList = (latestData.usersList || []).filter(item => item.username !== uName);
+                        try { localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(latestData)); } catch (e) {}
+                        document.getElementById('top-active-user').textContent = latestData.activeUser || 'Đang trống';
+                        renderUserTable(latestData.usersList);
+                        fetch('/my-admin/delete?pass=' + PASS + '&user=' + encodeURIComponent(uName))
+                            .then(() => syncAdminData())
+                            .catch(() => {});
+                    };
 
                     let lastChatSig = '';
                     function selectChatChannel(target) {
