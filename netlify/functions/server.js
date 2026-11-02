@@ -6,7 +6,7 @@ const TARGET_URL = 'https://lightvisual.studio';
 const ADMIN_PASS = 'admin123';
 const BRAND_NAME = 'AI Studio Pro';
 const SECRET_KEY = 'khoa-bao-mat-proxy-2026-queue-vip';
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 phút không thao tác sẽ tự nhường lượt
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 phút treo máy không thao tác sẽ tự nhường lượt
 
 const DB_FILE = '/tmp/database.json';
 let db = {
@@ -36,23 +36,28 @@ function loadDB() {
 }
 
 function saveDB() {
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8'); } catch (e) {}
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(db), 'utf8'); } catch (e) {}
 }
 
-// Kiểm tra xem request có phải là file tĩnh (.js, .css, ảnh, font...) không
+// Phân loại file tĩnh (JS, CSS, Font, Ảnh)
 function isStaticAsset(path) {
-    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|mp4|webm|json|map|wasm)$/i.test(path) ||
+    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|json|map|wasm)$/i.test(path) ||
            path.startsWith('/assets/') ||
            path.startsWith('/_next/') ||
            path.startsWith('/static/');
 }
 
-// Hàm điều phối Hàng chờ 1 Luồng (Kiểm tra hết giờ + Treo máy 10 phút)
+// Phân loại file Video / Audio nặng (Cần stream trực tiếp để không bị treo "Đang tải video...")
+function isMediaStream(path, acceptHeader = '') {
+    return /\.(mp4|webm|m3u8|ts|mov|mp3|wav|ogg)$/i.test(path) ||
+           acceptHeader.includes('video/') ||
+           acceptHeader.includes('audio/');
+}
+
 function syncQueueEngine() {
     const now = Date.now();
     let changed = false;
 
-    // 1. Kiểm tra người đang dùng luồng chính
     if (db.activeUser) {
         const u = db.users[db.activeUser];
         if (!u || db.kickedUsers[db.activeUser]) {
@@ -70,7 +75,6 @@ function syncQueueEngine() {
             const expireTime = u.firstLoginAt + u.durationMinutes * 60000;
             const isIdleTimeout = (now - u.lastInteractionAt) >= IDLE_TIMEOUT_MS;
 
-            // Đá ra nếu hết tổng thời gian HOẶC treo máy 10 phút không thao tác
             if (now >= expireTime || isIdleTimeout) {
                 u.isOnline = false;
                 db.activeUser = null;
@@ -79,7 +83,6 @@ function syncQueueEngine() {
         }
     }
 
-    // 2. Làm sạch danh sách hàng chờ
     const cleanQueue = [];
     for (const qUser of db.queue) {
         const u = db.users[qUser];
@@ -99,7 +102,6 @@ function syncQueueEngine() {
     }
     db.queue = cleanQueue;
 
-    // 3. Nếu luồng chính trống và có người đợi -> Đẩy người #1 vào ngay
     if (!db.activeUser && db.queue.length > 0) {
         const nextUser = db.queue.shift();
         const u = db.users[nextUser];
@@ -206,7 +208,6 @@ function formatTimeVN(sec) {
     return `${m} phút ${s < 10 ? '0' : ''}${s} giây`;
 }
 
-// Hàm khôi phục thông tin user nếu Netlify khởi tạo instance mới
 function ensureUserFromSession(session, userAgent, clientIp) {
     const username = session.username;
     if (!db.users[username]) {
@@ -223,7 +224,6 @@ function ensureUserFromSession(session, userAgent, clientIp) {
             ip: clientIp
         };
     }
-    // Nếu instance mới hoàn toàn trống luồng chính và user này đã kích hoạt giờ chơi -> Gán lại luồng chính
     if (!db.activeUser && db.queue.length === 0 && db.users[username].firstLoginAt) {
         db.activeUser = username;
     }
@@ -235,14 +235,28 @@ exports.handler = async (event) => {
     const method = event.httpMethod || 'GET';
     const query = event.queryStringParameters || {};
     const userAgent = event.headers['user-agent'] || '';
+    const acceptHeader = event.headers['accept'] || '';
+    const queryStr = event.rawQuery ? `?${event.rawQuery}` : '';
+    const targetFullUrl = `${TARGET_URL}${reqPath}${queryStr}`;
 
     // ==========================================
-    // 0. CHO PHÉP FILE TĨNH (.JS, .CSS, ẢNH...) ĐI THẲNG QUA PROXY ĐỂ KHÔNG BỊ ĐEN MÀN HÌNH
+    // 0A. TĂNG TỐC VIDEO / AUDIO: CHUYỂN HƯỚNG STREAM TRỰC TIẾP TỪ SERVER GỐC
+    // Giúp video phát ngay lập tức, không bị nghẽn RAM hay giới hạn 6MB của Netlify
+    // ==========================================
+    if (isMediaStream(reqPath, acceptHeader)) {
+        return {
+            statusCode: 302,
+            headers: {
+                'Location': targetFullUrl,
+                'Cache-Control': 'public, max-age=3600'
+            }
+        };
+    }
+
+    // ==========================================
+    // 0B. TĂNG TỐC FILE TĨNH (.JS, .CSS, ẢNH): CACHE DÀI HẠN TRÊN TRÌNH DUYỆT
     // ==========================================
     if (isStaticAsset(reqPath)) {
-        loadDB();
-        const queryStr = event.rawQuery ? `?${event.rawQuery}` : '';
-        const targetFullUrl = `${TARGET_URL}${reqPath}${queryStr}`;
         try {
             const response = await fetch(targetFullUrl, {
                 method,
@@ -251,7 +265,7 @@ exports.handler = async (event) => {
                     'Origin': TARGET_URL,
                     'Referer': `${TARGET_URL}/`,
                     'User-Agent': userAgent || 'Mozilla/5.0',
-                    'Accept': event.headers['accept'] || '*/*'
+                    'Accept': acceptHeader || '*/*'
                 }
             });
             const contentType = response.headers.get('content-type') || 'application/octet-stream';
@@ -260,7 +274,7 @@ exports.handler = async (event) => {
                 statusCode: response.status,
                 headers: {
                     'content-type': contentType,
-                    'cache-control': 'public, max-age=3600'
+                    'cache-control': 'public, max-age=86400, immutable'
                 },
                 body: Buffer.from(arrayBuffer).toString('base64'),
                 isBase64Encoded: true
@@ -548,7 +562,7 @@ exports.handler = async (event) => {
                                 activeSec = data.activeRemainSeconds;
                             }
                         }).catch(() => {});
-                    }, 3000);
+                    }, 4000);
                 </script>
             </body></html>`
         };
@@ -585,7 +599,6 @@ exports.handler = async (event) => {
         user.device = getDeviceName(userAgent);
         user.ip = clientIp;
 
-        // Cập nhật thao tác thật của người dùng nếu có cờ active=1 hoặc increment
         if (query.active === '1' || query.action === 'increment') {
             user.lastInteractionAt = Date.now();
         }
@@ -881,7 +894,6 @@ exports.handler = async (event) => {
         return { statusCode: 302, headers: { Location: '/sub-logout?reason=kicked' } };
     }
 
-    // Khôi phục thông tin user nếu Netlify đổi sang instance mới
     const currentUser = ensureUserFromSession(session, userAgent, clientIp);
     currentUser.lastInteractionAt = Date.now();
 
@@ -910,23 +922,23 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 6. CHUYỂN TIẾP SANG WEB GỐC & HIỂN THỊ THANH TRẠNG THÁI TRÊN STUDIO
+    // 6. CHUYỂN TIẾP SANG WEB GỐC & TỐI ƯU HIỆU NĂNG TRÌNH DUYỆT
     // ==========================================
-    const queryStr = event.rawQuery ? `?${event.rawQuery}` : '';
-    const targetFullUrl = `${TARGET_URL}${reqPath}${queryStr}`;
-
     const fetchHeaders = {
         'Cookie': db.masterCookie,
         'Origin': TARGET_URL,
         'Referer': `${TARGET_URL}/`,
         'User-Agent': userAgent || 'Mozilla/5.0',
-        'Accept': event.headers['accept'] || '*/*'
+        'Accept': acceptHeader || '*/*'
     };
 
     const clientCsrf = event.headers['x-csrf-token'] || event.headers['X-CSRF-Token'] || event.headers['x-xsrf-token'] || db.masterCsrfToken;
     if (clientCsrf) fetchHeaders['X-CSRF-Token'] = clientCsrf;
     if (event.headers['content-type']) fetchHeaders['Content-Type'] = event.headers['content-type'];
     if (event.headers['authorization']) fetchHeaders['Authorization'] = event.headers['authorization'];
+    if (event.headers['range'] || event.headers['Range']) {
+        fetchHeaders['Range'] = event.headers['range'] || event.headers['Range'];
+    }
 
     try {
         const response = await fetch(targetFullUrl, {
@@ -939,9 +951,16 @@ exports.handler = async (event) => {
         const resCsrf = response.headers.get('x-csrf-token');
         if (resCsrf) db.masterCsrfToken = resCsrf;
 
+        // Nếu response trả về là stream video/audio từ một endpoint API, chuyển hướng thẳng để trình duyệt tải mượt
+        if (contentType.includes('video/') || contentType.includes('audio/')) {
+            return {
+                statusCode: 302,
+                headers: { 'Location': response.url || targetFullUrl }
+            };
+        }
+
         if (contentType.includes('text/html')) {
             let html = await response.text();
-            // Chỉ đổi thẻ <title>, KHÔNG replace toàn bộ chuỗi HTML để tránh làm hỏng link script/JSON của web gốc
             html = html.replace(/<title>.*?<\/title>/i, `<title>${BRAND_NAME}</title>`);
 
             const remainSec = getRemainSeconds(currentUser);
@@ -978,13 +997,12 @@ exports.handler = async (event) => {
                     let maxQuota = ${maxQ};
                     let hasInteracted = false;
                     let idleSeconds = 0;
-                    const MAX_IDLE_SECONDS = 600; // 10 phút không thao tác chuột/phím sẽ tự nhường lượt
+                    const MAX_IDLE_SECONDS = 600;
 
                     const tEl = document.getElementById('time-left-val');
                     const qEl = document.getElementById('quota-val');
                     const qCountEl = document.getElementById('queue-count-val');
 
-                    // Ghi nhận thao tác chuột/bàn phím để chống treo máy (AFK)
                     ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'].forEach(evt => {
                         window.addEventListener(evt, () => {
                             hasInteracted = true;
@@ -1021,6 +1039,7 @@ exports.handler = async (event) => {
                         }
                     }, 1000);
 
+                    // Giãn nhịp đồng bộ ngầm lên 10 giây để không làm nghẽn mạng khi đang tải video/ảnh
                     const origFetch = window.fetch;
                     setInterval(() => {
                         const activeFlag = hasInteracted ? '?active=1' : '';
@@ -1037,7 +1056,7 @@ exports.handler = async (event) => {
                                 renderQuota();
                             }
                         }).catch(() => {});
-                    }, 4000);
+                    }, 10000);
 
                     document.addEventListener('click', function(e) {
                         const btn = e.target.closest('button');
@@ -1079,26 +1098,39 @@ exports.handler = async (event) => {
                     const f = ['Tải App', 'Báo lỗi / Góp ý', 'Báo lỗi', 'Vào Nhóm Zalo', 'Gói Vô Hạn', 'Nạp', 'API', 'Lịch sử request', 'Tạo API key', 'Powered by Netlify'];
                     if (${hideHistory}) f.push('Dự án', 'Thư viện');
 
+                    // Tối ưu dọn DOM: dùng Debounce 250ms + đánh dấu phần tử đã quét để không gây lag CPU
+                    let cleanTimer = null;
                     function c() {
-                        document.querySelectorAll('a, button, span, div').forEach(el => {
-                            if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar')) return;
+                        document.querySelectorAll('a:not([data-cleaned]), button:not([data-cleaned]), span:not([data-cleaned])').forEach(el => {
+                            if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar')) {
+                                el.setAttribute('data-cleaned', '1');
+                                return;
+                            }
                             const txt = (el.textContent || '').trim();
                             if (!txt || txt.length > 45) return;
+
                             if (el.children.length === 0 && (txt.toLowerCase() === 'lightvisual' || txt.toLowerCase() === '.studio')) {
                                 el.textContent = txt.toLowerCase() === 'lightvisual' ? '${BRAND_NAME}' : '';
+                                el.setAttribute('data-cleaned', '1');
+                                return;
                             }
                             if (el.children.length === 0 && /^[0-9\\.]+đ$/i.test(txt)) {
-                                const p = el.closest('button, a');
-                                if (p) p.style.display = 'none';
                                 el.style.display = 'none';
+                                el.setAttribute('data-cleaned', '1');
+                                return;
                             }
-                            if ((el.tagName === 'A' || el.tagName === 'BUTTON' || el.children.length === 0) && f.some(i => txt === i || txt.includes('Vào Nhóm Zalo') || txt.includes('Gói Vô Hạn') || txt.includes('Powered by Netlify'))) {
-                                (el.closest('a, button')||el).style.display = 'none';
+                            if (f.some(i => txt === i || txt.includes('Tải App') || txt.includes('Báo lỗi') || txt.includes('Vào Nhóm Zalo') || txt.includes('Gói Vô Hạn') || txt.includes('Powered by Netlify'))) {
+                                const target = el.closest('a, button') || el;
+                                target.style.display = 'none';
+                                el.setAttribute('data-cleaned', '1');
                             }
                         });
                     }
                     c();
-                    new MutationObserver(c).observe(document.documentElement, { childList: true, subtree: true });
+                    new MutationObserver(() => {
+                        if (cleanTimer) clearTimeout(cleanTimer);
+                        cleanTimer = setTimeout(c, 250);
+                    }).observe(document.documentElement, { childList: true, subtree: true });
                 })();
             </script>`;
 
@@ -1109,10 +1141,16 @@ exports.handler = async (event) => {
             };
         }
 
+        const outHeaders = { 'content-type': contentType };
+        ['content-range', 'accept-ranges', 'content-length', 'cache-control'].forEach(h => {
+            const val = response.headers.get(h);
+            if (val) outHeaders[h] = val;
+        });
+
         const arrayBuffer = await response.arrayBuffer();
         return {
             statusCode: response.status,
-            headers: { 'content-type': contentType },
+            headers: outHeaders,
             body: Buffer.from(arrayBuffer).toString('base64'),
             isBase64Encoded: true
         };
