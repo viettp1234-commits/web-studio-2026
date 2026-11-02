@@ -27,7 +27,6 @@ let db = {
     privateChats: {}    // uid -> [ { id, ts, sender, text, time, accountData } ]
 };
 
-// Hàm gộp danh sách tin nhắn không bao giờ bị trùng hoặc mất khi đổi container
 function mergeMessageLists(listA = [], listB = [], maxLen = 80) {
     const map = new Map();
     const combined = [...(Array.isArray(listA) ? listA : []), ...(Array.isArray(listB) ? listB : [])];
@@ -51,7 +50,6 @@ function mergeMessageLists(listA = [], listB = [], maxLen = 80) {
         .slice(-maxLen);
 }
 
-// Gộp dữ liệu toàn cục giữa bộ nhớ RAM và file /tmp hoặc dữ liệu đồng bộ từ trình duyệt
 function mergeIntoDB(incoming = {}) {
     if (!incoming || typeof incoming !== 'object') return;
 
@@ -204,30 +202,10 @@ function restoreConfigFromCookie(cookies) {
     }
 }
 
-function updateMasterCookieFromResponse(response) {
-    try {
-        const setCookieHeader = response.headers.get('set-cookie');
-        if (!setCookieHeader) return;
-        const match = setCookieHeader.match(/llmgw_session=([^;,\s]+)/);
-        if (match && match[1]) {
-            const newSession = `llmgw_session=${match[1]}`;
-            if (!db.masterCookie.includes(newSession)) {
-                if (db.masterCookie.includes('llmgw_session=')) {
-                    db.masterCookie = db.masterCookie.replace(/llmgw_session=[^;,\s]+/, newSession);
-                } else {
-                    db.masterCookie = `${db.masterCookie}; ${newSession}`;
-                }
-                db.configUpdatedAt = Date.now();
-                saveDB();
-            }
-        }
-    } catch (e) {}
-}
-
 function isStaticAsset(path) {
-    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|json|map|wasm)$/i.test(path) ||
+    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|map|wasm)$/i.test(path) ||
            path.startsWith('/assets/') ||
-           path.startsWith('/_next/') ||
+           path.startsWith('/_next/static/') ||
            path.startsWith('/static/');
 }
 
@@ -393,7 +371,10 @@ function ensureUserFromSession(session, userAgent, clientIp) {
     } else if (!db.users[username].password || db.users[username].password === '(Đã mã hóa)') {
         db.users[username].password = realPass;
     }
-    if (!db.activeUser && db.queue.length === 0 && db.users[username].firstLoginAt) {
+
+    // Nếu token xác nhận vừa được cấp luồng chính hoặc container mới chưa có activeUser -> Đồng bộ ngay lập tức
+    if ((!db.activeUser && db.queue.length === 0 && db.users[username].firstLoginAt) ||
+        (session.isActiveStream && (!db.activeUser || db.activeUser === username))) {
         db.activeUser = username;
     }
     return db.users[username];
@@ -420,7 +401,7 @@ function makeMsgId() {
 }
 
 // ==========================================
-// COMPONENT GIAO DIỆN WIDGET CHAT DÀNH CHO KHÁCH (KHÔNG BAO GIỜ MẤT KHI F5)
+// COMPONENT GIAO DIỆN WIDGET CHAT DÀNH CHO KHÁCH
 // ==========================================
 function getCustomerChatWidgetHTML(roleLabel = 'Khách', initialCookieUid = '') {
     return `
@@ -513,7 +494,6 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách', initialCookieUid = '') 
             const INITIAL_COOKIE_UID = ${JSON.stringify(initialCookieUid || '')};
             const STORAGE_KEY = 'VIP_CHAT_STORAGE_V3';
 
-            // Khôi phục trạng thái ngay lập tức khi F5 từ LocalStorage + Cookie
             let state = {
                 uid: INITIAL_COOKIE_UID || localStorage.getItem(' PERMANENT_CHAT_UID_V1 ') || '',
                 isOpen: false,
@@ -686,7 +666,6 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách', initialCookieUid = '') 
                 }).catch(() => { uidBtn.disabled = false; });
             });
 
-            // Đồng bộ 2 chiều: gửi cả lịch sử local lên để nếu gặp container mới thì tự động phục hồi
             function syncChat(newMessageObj = null) {
                 fetch('/chat-api?action=sync', {
                     method: 'POST',
@@ -752,7 +731,6 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách', initialCookieUid = '') 
                 }
             });
 
-            // Hiển thị ngay lập tức từ bộ nhớ khi vừa F5 (0ms)
             applyUIState();
             syncChat();
             setInterval(() => syncChat(), 3200);
@@ -801,7 +779,6 @@ exports.handler = async (event) => {
                     'Accept': acceptHeader || '*/*'
                 }
             });
-            updateMasterCookieFromResponse(response);
             const contentType = response.headers.get('content-type') || 'application/octet-stream';
             const arrayBuffer = await response.arrayBuffer();
             return {
@@ -858,7 +835,6 @@ exports.handler = async (event) => {
                 unreadForAdmin: existingChatUser.unreadForAdmin || 0
             };
 
-            // Khôi phục tin nhắn từ LocalStorage của khách nếu máy chủ hiện tại vừa khởi động lại
             if (Array.isArray(payload.localPrivate) && payload.localPrivate.length > 0) {
                 db.privateChats[uid] = mergeMessageLists(db.privateChats[uid] || [], payload.localPrivate, 80);
             }
@@ -876,7 +852,6 @@ exports.handler = async (event) => {
                 }];
             }
 
-            // Nếu khách gửi tin nhắn mới
             if (payload.newMessage && payload.newMessage.text) {
                 const nm = payload.newMessage;
                 const cleanMsg = {
@@ -939,6 +914,7 @@ exports.handler = async (event) => {
             statusCode: 200,
             headers: {
                 'content-type': 'text/html; charset=utf-8',
+                'cache-control': 'no-store, no-cache, must-revalidate',
                 'Set-Cookie': getConfigSyncCookie()
             },
             body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Đăng nhập & Xếp hàng - ${BRAND_NAME}</title><style>body{background:#0b0b0c;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#161618;padding:32px;border-radius:14px;border:1px solid #2a2a2e;width:390px;box-shadow:0 10px 30px rgba(0,0,0,0.6)}h2{margin-top:0;text-align:center;color:#f59e0b}input{width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#0f0f10;color:#fff;box-sizing:border-box}button{width:100%;padding:12px;background:#ea580c;color:#fff;border:none;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:10px;font-size:15px}.err{background:rgba(239,68,68,0.15);border:1px solid #ef4444;color:#f87171;padding:10px;border-radius:8px;font-size:13px;text-align:center;margin-bottom:12px}.note{color:#a1a1aa;font-size:12px;text-align:center;margin-top:14px;line-height:1.5}</style></head>
@@ -1020,11 +996,13 @@ exports.handler = async (event) => {
         user.lastActiveAt = now;
         user.lastInteractionAt = now;
 
+        let isActiveNow = false;
         if (!db.activeUser || db.activeUser === username) {
             db.activeUser = username;
             if (!user.firstLoginAt) user.firstLoginAt = now;
             user.isOnline = true;
             db.queue = db.queue.filter(u => u !== username);
+            isActiveNow = true;
         } else {
             if (!db.queue.includes(username)) {
                 db.queue.push(username);
@@ -1041,11 +1019,15 @@ exports.handler = async (event) => {
             maxQuota: user.maxQuota || 0,
             usedQuota: user.usedQuota || 0,
             firstLoginAt: user.firstLoginAt,
+            isActiveStream: isActiveNow,
             kicked: false
         });
 
+        const targetRedirect = isActiveNow ? '/' : '/waiting-room';
+
+        // Trả về trang chuyển hướng 200 OK để trình duyệt lưu chắc chắn 100% Cookie trước khi mở Studio
         return {
-            statusCode: 302,
+            statusCode: 200,
             multiValueHeaders: {
                 'Set-Cookie': [
                     `sub_token=${token}; Path=/; HttpOnly; Max-Age=86400`,
@@ -1053,7 +1035,20 @@ exports.handler = async (event) => {
                     getConfigSyncCookie()
                 ]
             },
-            headers: { 'Location': db.activeUser === username ? '/' : '/waiting-room' }
+            headers: {
+                'content-type': 'text/html; charset=utf-8',
+                'cache-control': 'no-store, no-cache, must-revalidate'
+            },
+            body: `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Đang vào Studio...</title></head><body style="background:#09090b;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;">
+                <div style="text-align:center;">
+                    <div style="font-size:28px;margin-bottom:10px;">🚀</div>
+                    <div style="color:#f59e0b;font-weight:bold;">Đang kết nối vào ${BRAND_NAME}...</div>
+                </div>
+                <script>
+                    sessionStorage.removeItem('AUTO_RELOADED_LANDING');
+                    window.location.replace(${JSON.stringify(targetRedirect)});
+                </script>
+            </body></html>`
         };
     }
 
@@ -1127,6 +1122,7 @@ exports.handler = async (event) => {
             statusCode: 200,
             headers: {
                 'content-type': 'text/html; charset=utf-8',
+                'cache-control': 'no-store, no-cache, must-revalidate',
                 'Set-Cookie': getConfigSyncCookie()
             },
             body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Phòng Chờ Đến Lượt - ${BRAND_NAME}</title>
@@ -1195,7 +1191,7 @@ exports.handler = async (event) => {
                                 return;
                             }
                             if (data.status === 'active') {
-                                window.location.href = '/';
+                                window.location.replace('/');
                                 return;
                             }
                             if (data.position) {
@@ -1205,7 +1201,7 @@ exports.handler = async (event) => {
                                 activeSec = data.activeRemainSeconds;
                             }
                         }).catch(() => {});
-                    }, 4000);
+                    }, 3500);
                 </script>
             </body></html>`
         };
@@ -1277,7 +1273,8 @@ exports.handler = async (event) => {
                 ...session,
                 password: user.password,
                 firstLoginAt: user.firstLoginAt,
-                usedQuota: user.usedQuota
+                usedQuota: user.usedQuota,
+                isActiveStream: true
             });
             return {
                 statusCode: 200,
@@ -1336,7 +1333,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 4. TRANG QUẢN TRỊ ADMIN (/my-admin) - CHỐNG RESET KHI F5 100%
+    // 4. TRANG QUẢN TRỊ ADMIN (/my-admin)
     // ==========================================
     if (reqPath.startsWith('/my-admin')) {
         if (query.pass !== ADMIN_PASS) {
@@ -1347,7 +1344,6 @@ exports.handler = async (event) => {
             let payload = {};
             try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
 
-            // Gộp dữ liệu từ LocalStorage của Admin lên nếu container hiện tại thiếu
             if (payload.adminBackup) {
                 mergeIntoDB(payload.adminBackup);
             }
@@ -1426,6 +1422,10 @@ exports.handler = async (event) => {
                     activeUser: db.activeUser,
                     queueLength: db.queue.length,
                     lastCreated: db.lastCreated,
+                    masterCookie: db.masterCookie,
+                    masterCsrfToken: db.masterCsrfToken,
+                    hideHistoryTabs: db.hideHistoryTabs,
+                    configUpdatedAt: db.configUpdatedAt,
                     users: db.users,
                     kickedUsers: db.kickedUsers,
                     usersList,
@@ -1618,6 +1618,10 @@ exports.handler = async (event) => {
                         activeUser: null,
                         queueLength: 0,
                         lastCreated: null,
+                        masterCookie: ${JSON.stringify(db.masterCookie)},
+                        masterCsrfToken: ${JSON.stringify(db.masterCsrfToken)},
+                        hideHistoryTabs: ${JSON.stringify(db.hideHistoryTabs)},
+                        configUpdatedAt: ${JSON.stringify(db.configUpdatedAt || 1)},
                         users: {},
                         kickedUsers: {},
                         usersList: [],
@@ -1649,6 +1653,12 @@ exports.handler = async (event) => {
                         latestData.activeUser = srv.activeUser !== undefined ? srv.activeUser : latestData.activeUser;
                         latestData.queueLength = srv.queueLength !== undefined ? srv.queueLength : latestData.queueLength;
                         if (srv.lastCreated) latestData.lastCreated = srv.lastCreated;
+                        if ((srv.configUpdatedAt || 0) >= (latestData.configUpdatedAt || 0) && srv.masterCookie) {
+                            latestData.masterCookie = srv.masterCookie;
+                            latestData.masterCsrfToken = srv.masterCsrfToken || '';
+                            latestData.hideHistoryTabs = Boolean(srv.hideHistoryTabs);
+                            latestData.configUpdatedAt = srv.configUpdatedAt;
+                        }
                         latestData.kickedUsers = { ...(latestData.kickedUsers || {}), ...(srv.kickedUsers || {}) };
 
                         const mergedUsers = { ...(latestData.users || {}), ...(srv.users || {}) };
@@ -1792,13 +1802,16 @@ exports.handler = async (event) => {
                         }
                     }
 
-                    // Đồng bộ 2 chiều giữa trình duyệt Admin và Server
                     function syncAdminData() {
                         fetch('/my-admin/api?pass=' + PASS, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 adminBackup: {
+                                    masterCookie: latestData.masterCookie,
+                                    masterCsrfToken: latestData.masterCsrfToken,
+                                    hideHistoryTabs: latestData.hideHistoryTabs,
+                                    configUpdatedAt: latestData.configUpdatedAt,
                                     users: latestData.users,
                                     kickedUsers: latestData.kickedUsers,
                                     chatUsers: latestData.chatUsers,
@@ -1863,6 +1876,10 @@ exports.handler = async (event) => {
                                 text,
                                 accountData,
                                 adminBackup: {
+                                    masterCookie: latestData.masterCookie,
+                                    masterCsrfToken: latestData.masterCsrfToken,
+                                    hideHistoryTabs: latestData.hideHistoryTabs,
+                                    configUpdatedAt: latestData.configUpdatedAt,
                                     chatUsers: latestData.chatUsers,
                                     publicMessages: latestData.publicMessages,
                                     privateChats: latestData.privateChats
@@ -1892,7 +1909,6 @@ exports.handler = async (event) => {
                         sendAdminMessage(msg, { username: lc.username, password: lc.password });
                     });
 
-                    // Hiển thị ngay lập tức dữ liệu đã lưu khi vừa F5 (0ms)
                     renderUserTable(latestData.usersList);
                     renderChatPanel();
                     syncAdminData();
@@ -1929,12 +1945,15 @@ exports.handler = async (event) => {
     const currentUser = ensureUserFromSession(session, userAgent, clientIp);
     currentUser.lastInteractionAt = Date.now();
 
-    if (db.activeUser !== username) {
+    // Chỉ chuyển hướng sang /waiting-room đối với truy cập trang HTML chính,
+    // KHÔNG chặn các request API JSON ngầm khi trình duyệt đang nạp trang Studio
+    const isHtmlNavigation = method === 'GET' && acceptHeader.includes('text/html');
+    if (isHtmlNavigation && db.activeUser && db.activeUser !== username) {
         return { statusCode: 302, headers: { Location: '/waiting-room' } };
     }
 
     if (!currentUser || getRemainSeconds(currentUser) <= 0) {
-        db.activeUser = null;
+        if (db.activeUser === username) db.activeUser = null;
         syncQueueEngine();
         saveDB();
         return { statusCode: 302, headers: { Location: '/sub-logout?reason=timeout' } };
@@ -1954,7 +1973,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 6. CHUYỂN TIẾP SANG WEB GỐC & HIỂN THỊ THANH TRẠNG THÁI + CHAT TRONG STUDIO
+    // 6. CHUYỂN TIẾP SANG WEB GỐC & TIÊM SCRIPT LÊN ĐẦU <HEAD> ĐỂ KHÔNG CẦN F5
     // ==========================================
     const fetchHeaders = {
         'Cookie': db.masterCookie,
@@ -1979,7 +1998,6 @@ exports.handler = async (event) => {
             body: ['GET', 'HEAD'].includes(method) ? undefined : (event.isBase64Encoded ? Buffer.from(event.body, 'base64') : event.body)
         });
 
-        updateMasterCookieFromResponse(response);
         const contentType = response.headers.get('content-type') || '';
         const resCsrf = response.headers.get('x-csrf-token');
         if (resCsrf && resCsrf !== db.masterCsrfToken) {
@@ -2003,6 +2021,31 @@ exports.handler = async (event) => {
             const usedQ = currentUser.usedQuota || 0;
             const maxQ = currentUser.maxQuota || 0;
             const hideHistory = db.hideHistoryTabs ? 'true' : 'false';
+
+            // Tiêm bộ chặn fetch ngay đầu <head> để mọi request xác thực của React đều nhận đủ CSRF Token ngay từ lần tải đầu tiên
+            const headInjector = `<script>
+                (function(){
+                    const savedCsrf = ${JSON.stringify(db.masterCsrfToken || '')};
+                    const origFetch = window.fetch;
+                    window.__ORIG_FETCH__ = origFetch;
+                    window.fetch = function(url, options = {}) {
+                        options.headers = options.headers || {};
+                        options.credentials = options.credentials || 'include';
+                        const csrfCookie = document.cookie.split('; ').find(r => r.startsWith('csrf') || r.startsWith('XSRF'));
+                        const token = (csrfCookie ? csrfCookie.split('=')[1] : '') || window.__CSRF_TOKEN__ || savedCsrf;
+                        if (token && !(options.headers instanceof Headers)) {
+                            options.headers['X-CSRF-Token'] = options.headers['X-CSRF-Token'] || token;
+                        }
+                        return origFetch.call(this, url, options);
+                    };
+                })();
+            </script>`;
+
+            if (/<head[^>]*>/i.test(html)) {
+                html = html.replace(/<head[^>]*>/i, match => match + headInjector);
+            } else {
+                html = headInjector + html;
+            }
 
             const shield = `<style>
                 a[href*="/api"], a[href*="zalo.me"], a[href*="pricing"], a[href*="billing"], a[href*="netlify.com"], iframe[src*="netlify"] { display: none !important; }
@@ -2039,6 +2082,7 @@ exports.handler = async (event) => {
                     const tEl = document.getElementById('time-left-val');
                     const qEl = document.getElementById('quota-val');
                     const qCountEl = document.getElementById('queue-count-val');
+                    const origFetch = window.__ORIG_FETCH__ || window.fetch;
 
                     ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'].forEach(evt => {
                         window.addEventListener(evt, () => {
@@ -2076,7 +2120,6 @@ exports.handler = async (event) => {
                         }
                     }, 1000);
 
-                    const origFetch = window.fetch;
                     setInterval(() => {
                         const activeFlag = hasInteracted ? '?active=1' : '';
                         hasInteracted = false;
@@ -2115,27 +2158,26 @@ exports.handler = async (event) => {
                         }
                     }, true);
 
-                    const savedCsrf = "${db.masterCsrfToken || ''}";
-                    window.fetch = function(url, options = {}) {
-                        const method = (options.method || 'GET').toUpperCase();
-                        const urlStr = String(url);
-                        if (method === 'POST' && !urlStr.includes('/sub-status') && !urlStr.includes('/chat-api') && maxQuota > 0 && usedQuota > maxQuota) {
-                            return Promise.reject(new Error('Đã vượt quá giới hạn số lượt tạo!'));
-                        }
-                        options.headers = options.headers || {};
-                        const csrfCookie = document.cookie.split('; ').find(r => r.startsWith('csrf') || r.startsWith('XSRF'));
-                        const token = (csrfCookie ? csrfCookie.split('=')[1] : '') || window.__CSRF_TOKEN__ || savedCsrf;
-                        if (token && !(options.headers instanceof Headers)) {
-                            options.headers['X-CSRF-Token'] = options.headers['X-CSRF-Token'] || token;
-                        }
-                        return origFetch(url, options);
-                    };
-
                     const f = ['Tải App', 'Báo lỗi / Góp ý', 'Báo lỗi', 'Vào Nhóm Zalo', 'Gói Vô Hạn', 'Nạp', 'API', 'Lịch sử request', 'Tạo API key', 'Powered by Netlify'];
                     if (${hideHistory}) f.push('Dự án', 'Thư viện');
 
                     let cleanTimer = null;
                     function c() {
+                        // Tự động phát hiện nếu bị kẹt ở màn hình giới thiệu ("Tạo video và ảnh cho shop của bạn") thì tự làm mới ngầm ngay mà không cần bấm F5
+                        const bodyTxt = document.body ? (document.body.innerText || '') : '';
+                        if (bodyTxt.includes('Tạo video và ảnh') && bodyTxt.includes('cho shop của bạn')) {
+                            const reloadCount = parseInt(sessionStorage.getItem('AUTO_RELOADED_LANDING') || '0', 10);
+                            if (reloadCount < 2) {
+                                sessionStorage.setItem('AUTO_RELOADED_LANDING', String(reloadCount + 1));
+                                origFetch('/sub-status?active=1').finally(() => {
+                                    window.location.replace('/?v=' + Date.now());
+                                });
+                                return;
+                            }
+                        } else if (bodyTxt.includes('Bạn muốn làm gì')) {
+                            sessionStorage.removeItem('AUTO_RELOADED_LANDING');
+                        }
+
                         document.querySelectorAll('a:not([data-cleaned]), button:not([data-cleaned]), span:not([data-cleaned])').forEach(el => {
                             if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar') || el.closest('#vip-chat-modal') || el.id === 'vip-chat-launcher') {
                                 el.setAttribute('data-cleaned', '1');
@@ -2164,7 +2206,7 @@ exports.handler = async (event) => {
                     c();
                     new MutationObserver(() => {
                         if (cleanTimer) clearTimeout(cleanTimer);
-                        cleanTimer = setTimeout(c, 250);
+                        cleanTimer = setTimeout(c, 200);
                     }).observe(document.documentElement, { childList: true, subtree: true });
                 })();
             </script>`;
@@ -2173,6 +2215,7 @@ exports.handler = async (event) => {
                 statusCode: response.status,
                 headers: {
                     'content-type': 'text/html; charset=utf-8',
+                    'cache-control': 'no-store, no-cache, must-revalidate',
                     'Set-Cookie': getConfigSyncCookie()
                 },
                 body: html.replace('</body>', shield + '</body>')
