@@ -5,16 +5,15 @@ const querystring = require('querystring');
 const TARGET_URL = 'https://lightvisual.studio';
 const ADMIN_PASS = 'admin123';
 const BRAND_NAME = 'AI Studio Pro';
-const SECRET_KEY = 'khoa-bao-mat-proxy-2026';
+const SECRET_KEY = 'khoa-bao-mat-proxy-2026-vip';
 
 const DB_FILE = '/tmp/database.json';
 let db = {
     masterCookie: '_fbp=fb.1.1791519268646.363735489448337118; llmgw_session=M1Y2NgLnIDTr9nJ21I4RrvOGHLovdiW0pH8-obhseXE',
     masterCsrfToken: '',
     hideHistoryTabs: false,
-    users: {
-        'admin': { password: 'admin', durationMinutes: 60, firstLoginAt: null, maxQuota: 50, usedQuota: 0 }
-    }
+    lastCreated: null,
+    users: {}
 };
 
 if (fs.existsSync(DB_FILE)) {
@@ -23,6 +22,31 @@ if (fs.existsSync(DB_FILE)) {
 const saveDB = () => {
     try { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8'); } catch (e) {}
 };
+
+// Hàm tạo chuỗi ngẫu nhiên cho Tài khoản & Mật khẩu
+function randomStr(len) {
+    const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+    let out = '';
+    for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+}
+
+// Nhận diện tên thiết bị từ trình duyệt của khách
+function getDeviceName(ua = '') {
+    let os = 'Thiết bị khác';
+    if (ua.includes('Windows')) os = '💻 Windows PC';
+    else if (ua.includes('Macintosh') || ua.includes('Mac OS')) os = '💻 MacBook/Mac';
+    else if (ua.includes('iPhone') || ua.includes('iPad')) os = '📱 iPhone/iPad';
+    else if (ua.includes('Android')) os = '📱 Điện thoại Android';
+
+    let browser = 'Trình duyệt';
+    if (ua.includes('Edg/')) browser = 'Edge';
+    else if (ua.includes('Chrome/')) browser = 'Chrome';
+    else if (ua.includes('Safari/') && !ua.includes('Chrome')) browser = 'Safari';
+    else if (ua.includes('Firefox/')) browser = 'Firefox';
+
+    return `${os} (${browser})`;
+}
 
 function signToken(data) {
     const payload = Buffer.from(JSON.stringify(data)).toString('base64url');
@@ -55,14 +79,18 @@ exports.handler = async (event) => {
     const query = event.queryStringParameters || {};
     const cookies = parseCookies(event.headers.cookie || event.headers.Cookie);
     const bodyText = event.isBase64Encoded ? Buffer.from(event.body || '', 'base64').toString('utf8') : (event.body || '');
+    const clientIp = (event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'Không rõ IP').split(',')[0].trim();
+    const userAgent = event.headers['user-agent'] || '';
 
-    // 1. TRANG ĐĂNG NHẬP
+    // ==========================================
+    // 1. TRANG ĐĂNG NHẬP KHÁCH (CHỈ CHO ĐĂNG NHẬP 1 LẦN)
+    // ==========================================
     if (reqPath === '/sub-login' && method === 'GET') {
         const errorMsg = query.err || '';
         return {
             statusCode: 200,
             headers: { 'content-type': 'text/html; charset=utf-8' },
-            body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Đăng nhập - ${BRAND_NAME}</title><style>body{background:#0b0b0c;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#161618;padding:32px;border-radius:14px;border:1px solid #2a2a2e;width:340px;box-shadow:0 10px 30px rgba(0,0,0,0.6)}h2{margin-top:0;text-align:center;color:#f59e0b}input{width:100%;padding:12px;margin:10px 0;border-radius:8px;border:1px solid #333;background:#0f0f10;color:#fff;box-sizing:border-box}button{width:100%;padding:12px;background:#ea580c;color:#fff;border:none;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:10px}.err{color:#ef4444;font-size:13px;text-align:center;margin-bottom:10px}</style></head><body><div class="box"><h2>${BRAND_NAME}</h2>${errorMsg ? `<div class="err">${errorMsg}</div>` : ''}<form method="POST" action="/sub-login"><input type="text" name="username" placeholder="Tài khoản" required /><input type="password" name="password" placeholder="Mật khẩu" required /><button type="submit">Vào Studio</button></form></div></body></html>`
+            body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Đăng nhập - ${BRAND_NAME}</title><style>body{background:#0b0b0c;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#161618;padding:32px;border-radius:14px;border:1px solid #2a2a2e;width:350px;box-shadow:0 10px 30px rgba(0,0,0,0.6)}h2{margin-top:0;text-align:center;color:#f59e0b}input{width:100%;padding:12px;margin:10px 0;border-radius:8px;border:1px solid #333;background:#0f0f10;color:#fff;box-sizing:border-box}button{width:100%;padding:12px;background:#ea580c;color:#fff;border:none;border-radius:8px;font-weight:bold;cursor:pointer;margin-top:10px}.err{background:rgba(239,68,68,0.15);border:1px solid #ef4444;color:#f87171;padding:10px;border-radius:8px;font-size:13px;text-align:center;margin-bottom:12px}.note{color:#a1a1aa;font-size:12px;text-align:center;margin-top:14px}</style></head><body><div class="box"><h2>${BRAND_NAME}</h2>${errorMsg ? `<div class="err">${errorMsg}</div>` : ''}<form method="POST" action="/sub-login"><input type="text" name="username" placeholder="Tài khoản được cấp" required /><input type="password" name="password" placeholder="Mật khẩu" required /><button type="submit">Đăng Nhập Vào Studio</button></form><div class="note">⚠️ Lưu ý: Mỗi tài khoản chỉ đăng nhập được duy nhất 1 lần trên 1 thiết bị.</div></div></body></html>`
         };
     }
 
@@ -76,18 +104,28 @@ exports.handler = async (event) => {
             return { statusCode: 302, headers: { Location: '/sub-login?err=' + encodeURIComponent('Sai tài khoản hoặc mật khẩu!') } };
         }
 
-        const now = Date.now();
-        if (!user.firstLoginAt) {
-            user.firstLoginAt = now;
-            saveDB();
-        }
-        const expireTime = user.firstLoginAt + user.durationMinutes * 60 * 1000;
-        if (now > expireTime) {
-            return { statusCode: 302, headers: { Location: '/sub-login?err=' + encodeURIComponent('Tài khoản đã hết thời gian sử dụng!') } };
+        // KIỂM TRA ĐĂNG NHẬP 1 LẦN DUY NHẤT
+        if (user.isUsed) {
+            return {
+                statusCode: 302,
+                headers: { Location: '/sub-login?err=' + encodeURIComponent('Tài khoản này chỉ được đăng nhập 1 lần duy nhất và đã được sử dụng!') }
+            };
         }
 
-        const token = signToken({ username, expireTime, maxQuota: user.maxQuota, usedQuota: user.usedQuota || 0 });
+        const now = Date.now();
+        const sessionId = randomStr(12);
+        user.isUsed = true; // Khóa ngay sau lần đăng nhập đầu tiên
+        user.firstLoginAt = now;
+        user.lastActiveAt = now;
+        user.sessionId = sessionId;
+        user.device = getDeviceName(userAgent);
+        user.ip = clientIp;
+        saveDB();
+
+        const expireTime = now + user.durationMinutes * 60 * 1000;
+        const token = signToken({ username, sessionId, expireTime });
         const maxAgeSec = Math.floor((expireTime - now) / 1000);
+
         return {
             statusCode: 302,
             headers: {
@@ -98,16 +136,19 @@ exports.handler = async (event) => {
     }
 
     if (reqPath === '/sub-logout') {
+        const msg = query.reason === 'timeout' ? 'Đã hết số phút sử dụng! Bạn đã được đăng xuất tự động.' : 'Bạn đã đăng xuất (Tài khoản 1 lần không thể đăng nhập lại).';
         return {
             statusCode: 302,
             headers: {
                 'Set-Cookie': 'sub_token=; Path=/; HttpOnly; Max-Age=0',
-                'Location': '/sub-login'
+                'Location': '/sub-login?err=' + encodeURIComponent(msg)
             }
         };
     }
 
-    // 2. TRANG QUẢN TRỊ ADMIN
+    // ==========================================
+    // 2. TRANG ADMIN QUẢN LÝ (TẠO RANDOM TK/MK THEO PHÚT & XEM MÁY HOẠT ĐỘNG)
+    // ==========================================
     if (reqPath.startsWith('/my-admin')) {
         if (query.pass !== ADMIN_PASS) {
             return { statusCode: 403, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: 'Sai mật khẩu Admin!' };
@@ -122,15 +163,25 @@ exports.handler = async (event) => {
             return { statusCode: 302, headers: { Location: `/my-admin?pass=${ADMIN_PASS}` } };
         }
 
-        if (reqPath === '/my-admin/user' && method === 'POST') {
+        // TẠO RANDOM TÀI KHOẢN & MẬT KHẨU CHỈ CẦN NHẬP SỐ PHÚT
+        if (reqPath === '/my-admin/random-user' && method === 'POST') {
             const form = querystring.parse(bodyText);
-            db.users[(form.username || '').trim()] = {
-                password: (form.password || '').trim(),
-                durationMinutes: parseInt(form.durationMinutes, 10) || 60,
+            const mins = parseInt(form.durationMinutes, 10) || 60;
+            const randomUsername = 'user_' + Math.floor(1000 + Math.random() * 9000);
+            const randomPassword = randomStr(6);
+
+            db.users[randomUsername] = {
+                password: randomPassword,
+                durationMinutes: mins,
+                isUsed: false,
                 firstLoginAt: null,
-                maxQuota: parseInt(form.maxQuota, 10) || 30,
+                lastActiveAt: null,
+                sessionId: null,
+                device: 'Chưa có máy đăng nhập',
+                ip: '-',
                 usedQuota: 0
             };
+            db.lastCreated = { username: randomUsername, password: randomPassword, durationMinutes: mins };
             saveDB();
             return { statusCode: 302, headers: { Location: `/my-admin?pass=${ADMIN_PASS}` } };
         }
@@ -141,34 +192,119 @@ exports.handler = async (event) => {
             return { statusCode: 302, headers: { Location: `/my-admin?pass=${ADMIN_PASS}` } };
         }
 
-        const userRows = Object.entries(db.users).map(([u, info]) => {
-            let status = 'Chưa kích hoạt';
-            if (info.firstLoginAt) {
-                const remain = Math.round((info.firstLoginAt + info.durationMinutes * 60000 - Date.now()) / 60000);
-                status = remain > 0 ? `Còn ${remain} phút` : 'Đã hết hạn';
+        const now = Date.now();
+        const userRows = Object.entries(db.users).reverse().map(([u, info]) => {
+            let statusBadge = '<span style="color:#a1a1aa;">⏳ Chưa đăng nhập (Còn nguyên 1 lần)</span>';
+            let machineInfo = '<span style="color:#71717a;">Chưa có máy nào vào</span>';
+
+            if (info.isUsed && info.firstLoginAt) {
+                const expireTime = info.firstLoginAt + info.durationMinutes * 60000;
+                const remainMins = Math.ceil((expireTime - now) / 60000);
+
+                if (remainMins > 0) {
+                    statusBadge = `<span style="color:#22c55e;font-weight:bold;">🟢 Đang hoạt động (Còn ${remainMins} phút)</span>`;
+                    machineInfo = `<b>${info.device}</b><br><span style="font-size:12px;color:#a1a1aa;">IP: ${info.ip} | Đã khóa 1/1 lần</span>`;
+                } else {
+                    statusBadge = `<span style="color:#ef4444;font-weight:bold;">🔴 Đã hết giờ (Tự động Out)</span>`;
+                    machineInfo = `${info.device} (IP: ${info.ip})`;
+                }
             }
-            return `<tr><td><b>${u}</b></td><td>${info.password}</td><td>${info.durationMinutes} phút</td><td>${status}</td><td>${info.usedQuota || 0} / ${info.maxQuota}</td><td><a href="/my-admin/delete?pass=${ADMIN_PASS}&user=${u}" style="color:#ef4444;">Xóa</a></td></tr>`;
+
+            const copyText = `Link: https://${event.headers.host} | TK: ${u} | MK: ${info.password} (${info.durationMinutes} phút)`;
+
+            return `<tr>
+                <td><b style="color:#f59e0b;font-size:15px;">${u}</b></td>
+                <td><code style="background:#27272a;padding:4px 8px;border-radius:4px;font-size:14px;">${info.password}</code></td>
+                <td><b>${info.durationMinutes} phút</b></td>
+                <td>${statusBadge}</td>
+                <td>${machineInfo}</td>
+                <td>
+                    <button type="button" onclick="navigator.clipboard.writeText('${copyText}');this.textContent='Đã Copy!';" style="padding:6px 10px;font-size:12px;margin-right:6px;background:#3b82f6;color:#fff;">Copy</button>
+                    <a href="/my-admin/delete?pass=${ADMIN_PASS}&user=${u}" style="color:#ef4444;font-weight:bold;text-decoration:none;">Xóa / Đá</a>
+                </td>
+            </tr>`;
         }).join('');
+
+        const lastCreatedBox = db.lastCreated ? `
+            <div style="background:#14532d;border:1px solid #22c55e;padding:14px;border-radius:8px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                    ✅ <b>Vừa tạo thành công (${db.lastCreated.durationMinutes} phút):</b> 
+                    Tài khoản: <b style="color:#facc15;font-size:16px;">${db.lastCreated.username}</b> | 
+                    Mật khẩu: <b style="color:#facc15;font-size:16px;">${db.lastCreated.password}</b>
+                </div>
+                <button type="button" onclick="navigator.clipboard.writeText('Link: https://${event.headers.host}\\nTài khoản: ${db.lastCreated.username}\\nMật khẩu: ${db.lastCreated.password}\\nThời gian: ${db.lastCreated.durationMinutes} phút (Lưu ý: Chỉ đăng nhập được 1 lần duy nhất)');this.textContent='Đã Copy!';" style="background:#22c55e;color:#000;">📋 Copy gửi khách</button>
+            </div>` : '';
 
         return {
             statusCode: 200,
             headers: { 'content-type': 'text/html; charset=utf-8' },
-            body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Admin - ${BRAND_NAME}</title><style>body{background:#0f0f11;color:#e4e4e7;font-family:system-ui,sans-serif;padding:30px;max-width:900px;margin:auto}.card{background:#18181b;padding:20px;border-radius:10px;border:1px solid #27272a;margin-bottom:24px}input,textarea{width:100%;padding:10px;margin:6px 0 14px;background:#09090b;border:1px solid #3f3f46;color:#fff;border-radius:6px;box-sizing:border-box}button{background:#f59e0b;color:#000;border:none;padding:10px 20px;border-radius:6px;font-weight:bold;cursor:pointer}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #27272a;padding:10px;text-align:left}</style></head><body><h2>Quản trị Hệ thống Netlify (${BRAND_NAME})</h2><div class="card"><h3>1. Cấu hình Cookie gốc</h3><form method="POST" action="/my-admin/config?pass=${ADMIN_PASS}"><textarea name="masterCookie" rows="3">${db.masterCookie}</textarea><input type="text" name="masterCsrfToken" value="${db.masterCsrfToken}" placeholder="X-CSRF-Token (Tự động lấy hoặc dán thủ công)..." /><label><input type="checkbox" name="hideHistoryTabs" style="width:auto;" ${db.hideHistoryTabs ? 'checked' : ''} /> Ẩn tab Dự án & Thư viện</label><br><br><button type="submit">Lưu Cấu Hình Gốc</button></form></div><div class="card"><h3>2. Tạo / Gia hạn Tài khoản con</h3><form method="POST" action="/my-admin/user?pass=${ADMIN_PASS}"><input type="text" name="username" placeholder="Tên đăng nhập" required /><input type="text" name="password" placeholder="Mật khẩu" required /><input type="number" name="durationMinutes" placeholder="Số phút (VD: 120)" required /><input type="number" name="maxQuota" value="30" required /><button type="submit">Tạo / Cập nhật Tài khoản</button></form></div><div class="card"><h3>3. Danh sách Tài khoản</h3><table><tr><th>Tài khoản</th><th>Mật khẩu</th><th>Thời lượng</th><th>Trạng thái</th><th>Lượt bấm</th><th>Thao tác</th></tr>${userRows}</table></div></body></html>`
+            body: `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Admin - ${BRAND_NAME}</title><style>body{background:#0f0f11;color:#e4e4e7;font-family:system-ui,sans-serif;padding:24px;max-width:1050px;margin:auto}.card{background:#18181b;padding:20px;border-radius:10px;border:1px solid #27272a;margin-bottom:22px}input,textarea{width:100%;padding:11px;margin:6px 0 14px;background:#09090b;border:1px solid #3f3f46;color:#fff;border-radius:6px;box-sizing:border-box}button{background:#f59e0b;color:#000;border:none;padding:11px 20px;border-radius:6px;font-weight:bold;cursor:pointer}table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #27272a;padding:10px;text-align:left;font-size:14px}th{background:#27272a}</style></head>
+            <body>
+                <h2>Quản trị Hệ thống (${BRAND_NAME})</h2>
+                
+                <div class="card">
+                    <h3>🎲 1. Tạo Random Tài khoản & Mật khẩu (Giới hạn 1 lần đăng nhập)</h3>
+                    ${lastCreatedBox}
+                    <form method="POST" action="/my-admin/random-user?pass=${ADMIN_PASS}" style="display:flex;gap:12px;align-items:center;">
+                        <input type="number" name="durationMinutes" placeholder="Nhập số phút cho phép dùng (VD: 60, 120...)" required style="margin:0;flex:1;font-size:15px;" />
+                        <button type="submit" style="white-space:nowrap;font-size:15px;">🎲 Bấm Tạo TK Ngẫu Nhiên</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <h3>🖥️ 2. Danh sách Tài khoản & Máy đang hoạt động</h3>
+                        <a href="/my-admin?pass=${ADMIN_PASS}" style="color:#f59e0b;text-decoration:none;font-size:14px;">🔄 Làm mới trạng thái</a>
+                    </div>
+                    <table>
+                        <tr><th>Tài khoản</th><th>Mật khẩu</th><th>Số phút</th><th>Trạng thái hoạt động</th><th>Máy đang dùng / IP</th><th>Thao tác</th></tr>
+                        ${userRows || '<tr><td colspan="6" style="text-align:center;color:#71717a;">Chưa có tài khoản nào. Hãy nhập số phút ở mục 1 để tạo!</td></tr>'}
+                    </table>
+                </div>
+
+                <div class="card">
+                    <h3>⚙️ 3. Cấu hình Cookie & X-CSRF-Token gốc</h3>
+                    <form method="POST" action="/my-admin/config?pass=${ADMIN_PASS}">
+                        <textarea name="masterCookie" rows="2">${db.masterCookie}</textarea>
+                        <input type="text" name="masterCsrfToken" value="${db.masterCsrfToken}" placeholder="X-CSRF-Token (Nếu có)..." />
+                        <label><input type="checkbox" name="hideHistoryTabs" style="width:auto;" ${db.hideHistoryTabs ? 'checked' : ''} /> Ẩn luôn tab Dự án & Thư viện</label><br><br>
+                        <button type="submit">Lưu Cấu Hình Gốc</button>
+                    </form>
+                </div>
+            </body></html>`
         };
     }
 
-    // 3. KIỂM TRA PHIÊN ĐĂNG NHẬP
+    // ==========================================
+    // 3. KIỂM TRA PHIÊN ĐANG CHẠY & TỰ ĐỘNG ĐÁ VĂNG KHI HẾT GIỜ
+    // ==========================================
     const session = verifyToken(cookies.sub_token);
     if (!session || Date.now() > session.expireTime) {
-        return { statusCode: 302, headers: { Location: '/sub-login' } };
+        return {
+            statusCode: 302,
+            headers: {
+                'Set-Cookie': 'sub_token=; Path=/; HttpOnly; Max-Age=0',
+                'Location': '/sub-login?err=' + encodeURIComponent('Đã hết số phút sử dụng hoặc phiên đã kết thúc!')
+            }
+        };
     }
 
-    // Chặn khách mở trang API key
+    // Kiểm tra nếu Admin đã bấm Xóa tài khoản này thì đá văng ngay lập tức
+    const dbUser = db.users[session.username];
+    if (dbUser && dbUser.sessionId && dbUser.sessionId !== session.sessionId) {
+        return { statusCode: 302, headers: { Location: '/sub-login?err=' + encodeURIComponent('Phiên đăng nhập không hợp lệ!') } };
+    }
+    if (dbUser) {
+        dbUser.lastActiveAt = Date.now();
+    }
+
     if (reqPath.toLowerCase() === '/app/api' || reqPath.toLowerCase().startsWith('/v1/keys')) {
         return { statusCode: 302, headers: { Location: '/' } };
     }
 
-    // 4. CHUYỂN TIẾP LỆNH & XỬ LÝ X-CSRF-TOKEN TỰ ĐỘNG
+    // ==========================================
+    // 4. CHUYỂN TIẾP LỆNH SANG WEB GỐC & HIỂN THỊ ĐỒNG HỒ ĐẾM NGƯỢC
+    // ==========================================
     const queryStr = event.rawQuery ? `?${event.rawQuery}` : '';
     const targetFullUrl = `${TARGET_URL}${reqPath}${queryStr}`;
 
@@ -176,21 +312,14 @@ exports.handler = async (event) => {
         'Cookie': db.masterCookie,
         'Origin': TARGET_URL,
         'Referer': `${TARGET_URL}/`,
-        'User-Agent': event.headers['user-agent'] || 'Mozilla/5.0',
+        'User-Agent': userAgent || 'Mozilla/5.0',
         'Accept': event.headers['accept'] || '*/*'
     };
 
-    // Chuyển tiếp X-CSRF-Token từ trình duyệt hoặc từ cấu hình gốc
     const clientCsrf = event.headers['x-csrf-token'] || event.headers['X-CSRF-Token'] || event.headers['x-xsrf-token'] || db.masterCsrfToken;
-    if (clientCsrf) {
-        fetchHeaders['X-CSRF-Token'] = clientCsrf;
-    }
-    if (event.headers['content-type']) {
-        fetchHeaders['Content-Type'] = event.headers['content-type'];
-    }
-    if (event.headers['authorization']) {
-        fetchHeaders['Authorization'] = event.headers['authorization'];
-    }
+    if (clientCsrf) fetchHeaders['X-CSRF-Token'] = clientCsrf;
+    if (event.headers['content-type']) fetchHeaders['Content-Type'] = event.headers['content-type'];
+    if (event.headers['authorization']) fetchHeaders['Authorization'] = event.headers['authorization'];
 
     try {
         const response = await fetch(targetFullUrl, {
@@ -201,11 +330,8 @@ exports.handler = async (event) => {
 
         const contentType = response.headers.get('content-type') || '';
         const resCsrf = response.headers.get('x-csrf-token');
-        if (resCsrf) {
-            db.masterCsrfToken = resCsrf;
-        }
+        if (resCsrf) db.masterCsrfToken = resCsrf;
 
-        // Tự động bắt lấy csrf_token từ API /me hoặc /status nếu web gốc trả về trong JSON
         if (contentType.includes('application/json') && (reqPath.includes('/me') || reqPath.includes('/status') || reqPath.includes('/csrf'))) {
             const jsonText = await response.text();
             try {
@@ -227,7 +353,6 @@ exports.handler = async (event) => {
             const remainSec = Math.max(0, Math.floor((session.expireTime - Date.now()) / 1000));
             const hideHistory = db.hideHistoryTabs ? 'true' : 'false';
 
-            // Đưa bộ đếm giờ lên chính giữa mép trên màn hình & Xóa sạch các nút có icon
             const shield = `<style>
                 a[href*="/api"], a[href*="zalo.me"], a[href*="pricing"], a[href*="billing"], a[href*="netlify.com"], iframe[src*="netlify"] { display: none !important; }
                 #custom-timer-bar {
@@ -235,15 +360,14 @@ exports.handler = async (event) => {
                     background: #161618; border: 1px solid #f59e0b;
                     color: #fff; padding: 6px 16px; border-radius: 99px;
                     font-family: system-ui, sans-serif; font-size: 13px;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.8); white-space: nowrap;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.85); white-space: nowrap;
                 }
             </style>
             <div id="custom-timer-bar">
-                ⏳ Còn lại: <b id="time-left-val" style="color:#f59e0b;">--:--</b> | <a href="/sub-logout" style="color:#ef4444;font-weight:bold;text-decoration:none;margin-left:8px;">Thoát</a>
+                👤 <b>${session.username}</b> | ⏳ Còn lại: <b id="time-left-val" style="color:#f59e0b;">--:--</b> | <a href="/sub-logout" style="color:#ef4444;font-weight:bold;text-decoration:none;margin-left:8px;">Thoát</a>
             </div>
             <script>
                 (function(){
-                    // Tự động đính kèm X-CSRF-Token vào mọi lệnh fetch từ trình duyệt
                     const savedCsrf = "${db.masterCsrfToken || ''}";
                     const origFetch = window.fetch;
                     window.fetch = function(url, options = {}) {
@@ -265,16 +389,19 @@ exports.handler = async (event) => {
                         });
                     };
 
-                    // Đồng hồ đếm ngược
+                    // Đếm ngược & Tự động văng ra ngoài khi hết số phút
                     let sec = ${remainSec};
                     const t = document.getElementById('time-left-val');
                     setInterval(() => {
                         sec--;
-                        if (sec <= 0) location.href = '/sub-logout';
-                        if (t) t.textContent = Math.floor(sec/60) + 'p ' + (sec%60 < 10 ? '0' : '') + (sec%60) + 's';
+                        if (sec <= 0) {
+                            window.location.href = '/sub-logout?reason=timeout';
+                        }
+                        if (t && sec >= 0) {
+                            t.textContent = Math.floor(sec/60) + 'p ' + (sec%60 < 10 ? '0' : '') + (sec%60) + 's';
+                        }
                     }, 1000);
 
-                    // Quét và ẩn các nút chứa icon (Tải App, Báo lỗi, API, Powered by Netlify)
                     const f = ['Tải App', 'Báo lỗi / Góp ý', 'Báo lỗi', 'Vào Nhóm Zalo', 'Gói Vô Hạn', 'Nạp', 'API', 'Lịch sử request', 'Tạo API key', 'Powered by Netlify'];
                     if (${hideHistory}) f.push('Dự án', 'Thư viện');
 
@@ -282,7 +409,6 @@ exports.handler = async (event) => {
                         document.querySelectorAll('a, button, span, div').forEach(el => {
                             const txt = (el.textContent || '').trim();
                             if (!txt || txt.length > 45) return;
-
                             if (el.children.length === 0 && (txt.toLowerCase() === 'lightvisual' || txt.toLowerCase() === '.studio')) {
                                 el.textContent = txt.toLowerCase() === 'lightvisual' ? '${BRAND_NAME}' : '';
                             }
