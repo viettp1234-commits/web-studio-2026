@@ -217,7 +217,7 @@ function restoreConfigFromCookie(cookies) {
 }
 
 function updateMasterCookieFromResponse() {
-    // Khóa tự động ghi đè để giữ nguyên 100% Cookie gốc Admin đã lưu
+    // Giữ nguyên 100% Cookie gốc của Admin, không cho session khách ghi đè
 }
 
 function isStaticAsset(path) {
@@ -2021,12 +2021,21 @@ exports.handler = async (event) => {
     const currentUser = ensureUserFromSession(session, userAgent, clientIp);
     currentUser.lastInteractionAt = Date.now();
 
-    if (db.activeUser !== username) {
+    // Nếu user đã được cấp quyền vào Studio (có firstLoginAt) và còn giờ, tự động giữ luồng chính trên mọi container
+    if (currentUser.firstLoginAt && getRemainSeconds(currentUser) > 0) {
+        const curActiveObj = db.activeUser ? db.users[db.activeUser] : null;
+        if (!db.activeUser || !curActiveObj || getRemainSeconds(curActiveObj) <= 0 || db.kickedUsers[db.activeUser]) {
+            db.activeUser = username;
+        }
+    }
+
+    const isHtmlNavigation = acceptHeader.includes('text/html');
+    if (db.activeUser !== username && isHtmlNavigation && !currentUser.firstLoginAt) {
         return { statusCode: 302, headers: { Location: '/waiting-room' } };
     }
 
     if (!currentUser || getRemainSeconds(currentUser) <= 0) {
-        db.activeUser = null;
+        if (db.activeUser === username) db.activeUser = null;
         syncQueueEngine();
         saveDB();
         return { statusCode: 302, headers: { Location: '/sub-logout?reason=timeout' } };
@@ -2046,7 +2055,7 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 6. CHUYỂN TIẾP SANG WEB GỐC & HIỂN THỊ THANH TRẠNG THÁI + CHAT TRONG STUDIO
+    // 6. CHUYỂN TIẾP SANG WEB GỐC & TỰ ĐỘNG RELOAD + CẢNH BÁO 20% THỜI GIAN
     // ==========================================
     const fetchHeaders = {
         'Cookie': db.masterCookie,
@@ -2065,13 +2074,13 @@ exports.handler = async (event) => {
     }
 
     try {
-        const response = await fetch(targetFullUrl, {
+        const cleanTargetUrl = targetFullUrl.replace(/([?&])_reload_ts=\d+&?/, '$1').replace(/[?&]$/, '');
+        const response = await fetch(cleanTargetUrl, {
             method,
             headers: fetchHeaders,
             body: ['GET', 'HEAD'].includes(method) ? undefined : (event.isBase64Encoded ? Buffer.from(event.body, 'base64') : event.body)
         });
 
-        updateMasterCookieFromResponse(response);
         const contentType = response.headers.get('content-type') || '';
         const resCsrf = response.headers.get('x-csrf-token');
         if (resCsrf && resCsrf !== db.masterCsrfToken) {
@@ -2083,7 +2092,7 @@ exports.handler = async (event) => {
         if (contentType.includes('video/') || contentType.includes('audio/')) {
             return {
                 statusCode: 302,
-                headers: { 'Location': response.url || targetFullUrl }
+                headers: { 'Location': response.url || cleanTargetUrl }
             };
         }
 
@@ -2092,6 +2101,8 @@ exports.handler = async (event) => {
             html = html.replace(/<title>.*?<\/title>/i, `<title>${BRAND_NAME}</title>`);
 
             const remainSec = getRemainSeconds(currentUser);
+            const totalPackageSec = (currentUser.durationMinutes || 60) * 60;
+            const warnThresholdSec = Math.max(30, Math.floor(totalPackageSec * 0.2)); // Ngưỡng 20% thời gian
             const usedQ = currentUser.usedQuota || 0;
             const maxQ = currentUser.maxQuota || 0;
             const hideHistory = db.hideHistoryTabs ? 'true' : 'false';
@@ -2104,9 +2115,36 @@ exports.handler = async (event) => {
                     color: #fff; padding: 6px 18px; border-radius: 99px;
                     font-family: system-ui, sans-serif; font-size: 13px;
                     box-shadow: 0 4px 20px rgba(0,0,0,0.9); white-space: nowrap;
-                    display: flex; align-items: center; gap: 10px;
+                    display: flex; align-items: center; gap: 10px; transition: all 0.3s;
                 }
+                #custom-timer-bar.low-time {
+                    background: #450a0a; border: 2px solid #ef4444;
+                    box-shadow: 0 0 25px rgba(239,68,68,0.8);
+                }
+                #low-time-strip {
+                    position: fixed; top: 46px; left: 50%; transform: translateX(-50%); z-index: 2147483646;
+                    background: linear-gradient(90deg, #dc2626, #ea580c); color: #fff;
+                    padding: 6px 18px; border-radius: 99px; font-family: system-ui, sans-serif;
+                    font-size: 12.5px; font-weight: bold; box-shadow: 0 4px 15px rgba(220,38,38,0.6);
+                    display: none; white-space: nowrap; animation: pulseWarn 1.2s infinite;
+                }
+                @keyframes pulseWarn { 0%, 100% { transform: translateX(-50%) scale(1); } 50% { transform: translateX(-50%) scale(1.03); } }
+                #low-time-modal {
+                    position: fixed; inset: 0; z-index: 2147483647; background: rgba(0,0,0,0.82);
+                    display: none; justify-content: center; align-items: center; font-family: system-ui, sans-serif;
+                }
+                #auto-sync-overlay {
+                    position: fixed; inset: 0; z-index: 2147483647; background: #09090b;
+                    display: none; flex-direction: column; justify-content: center; align-items: center;
+                    font-family: system-ui, sans-serif; color: #fff; text-align: center;
+                }
+                .sync-spinner {
+                    width: 46px; height: 46px; border: 4px solid #27272a; border-top-color: #f59e0b;
+                    border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 16px;
+                }
+                @keyframes spin { to { transform: rotate(360deg); } }
             </style>
+
             <div id="custom-timer-bar">
                 <span>🟢 <b>${username}</b></span>
                 <span>|</span>
@@ -2118,19 +2156,54 @@ exports.handler = async (event) => {
                 <span>|</span>
                 <a href="/sub-logout" style="color:#ef4444;font-weight:bold;text-decoration:none;">Thoát (Nhường lượt)</a>
             </div>
+
+            <!-- Thanh nhắc nhở cố định khi còn dưới 20% thời gian -->
+            <div id="low-time-strip">
+                ⚠️ SẮP HẾT GIỜ (Còn dưới 20% thời gian)! Bạn sắp bị đăng xuất, hãy TẢI XUỐNG hoặc LƯU dữ liệu về máy ngay!
+            </div>
+
+            <!-- Hộp thoại cảnh báo lớn khi chạm ngưỡng 20% thời gian -->
+            <div id="low-time-modal">
+                <div style="background:#18181b;border:2px solid #ef4444;border-radius:16px;padding:28px;max-width:440px;width:90%;text-align:center;color:#fff;box-shadow:0 20px 50px rgba(239,68,68,0.4);">
+                    <div style="font-size:44px;margin-bottom:8px;">⚠️</div>
+                    <h3 style="margin:0 0 10px 0;color:#f87171;font-size:19px;">CẢNH BÁO SẮP BỊ ĐĂNG XUẤT!</h3>
+                    <p style="color:#e4e4e7;font-size:14px;line-height:1.6;margin:0 0 18px 0;">
+                        Thời gian sử dụng của bạn chỉ còn <b>dưới 20%</b> (<b id="modal-remain-txt" style="color:#facc15;">-- phút -- giây</b>).<br><br>
+                        Hệ thống sẽ <b>tự động đăng xuất</b> ngay khi hết giờ. Vui lòng <b>Tải xuống</b> hoặc <b>Lưu toàn bộ Video / Ảnh / Dự án</b> về máy ngay bây giờ!
+                    </p>
+                    <button type="button" onclick="document.getElementById('low-time-modal').style.display='none';" style="background:#ef4444;color:#fff;border:none;padding:12px 24px;border-radius:10px;font-weight:bold;font-size:14px;cursor:pointer;width:100%;">
+                        Đã hiểu, để tôi tải dữ liệu về máy ngay
+                    </button>
+                </div>
+            </div>
+
+            <!-- Màn hình chờ tự động load lại nếu phát hiện trang gốc chưa nhận diện phiên đăng nhập -->
+            <div id="auto-sync-overlay">
+                <div class="sync-spinner"></div>
+                <h3 style="margin:0 0 8px 0;color:#f59e0b;font-size:18px;">⏳ Chờ hệ thống đồng bộ phiên làm việc...</h3>
+                <p style="color:#a1a1aa;font-size:13.5px;margin:0;">Đang tự động tải lại Studio cho bạn, vui lòng chờ trong giây lát (Không cần bấm F5).</p>
+            </div>
+
             ${getCustomerChatWidgetHTML('Đang dùng Studio', initialCookieUid)}
             <script>
                 (function(){
                     let sec = ${remainSec};
+                    const warnThreshold = ${warnThresholdSec};
+                    let hasShown20PercentModal = sessionStorage.getItem('WARN_20_SHOWN_${username}') === '1';
                     let usedQuota = ${usedQ};
                     let maxQuota = ${maxQ};
                     let hasInteracted = false;
                     let idleSeconds = 0;
                     const MAX_IDLE_SECONDS = 600;
 
+                    const barEl = document.getElementById('custom-timer-bar');
                     const tEl = document.getElementById('time-left-val');
                     const qEl = document.getElementById('quota-val');
                     const qCountEl = document.getElementById('queue-count-val');
+                    const lowStripEl = document.getElementById('low-time-strip');
+                    const lowModalEl = document.getElementById('low-time-modal');
+                    const modalRemainEl = document.getElementById('modal-remain-txt');
+                    const syncOverlayEl = document.getElementById('auto-sync-overlay');
 
                     ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'].forEach(evt => {
                         window.addEventListener(evt, () => {
@@ -2164,7 +2237,20 @@ exports.handler = async (event) => {
                             const h = Math.floor(sec / 3600);
                             const m = Math.floor((sec % 3600) / 60);
                             const s = sec % 60;
-                            tEl.textContent = (h > 0 ? h + 'h ' : '') + m + 'p ' + (s < 10 ? '0' : '') + s + 's';
+                            const timeStr = (h > 0 ? h + 'h ' : '') + m + 'p ' + (s < 10 ? '0' : '') + s + 's';
+                            tEl.textContent = timeStr;
+                            if (modalRemainEl) modalRemainEl.textContent = timeStr;
+
+                            // Kiểm tra khi thời gian còn lại chạm ngưỡng <= 20%
+                            if (sec <= warnThreshold) {
+                                if (barEl) barEl.classList.add('low-time');
+                                if (lowStripEl) lowStripEl.style.display = 'block';
+                                if (!hasShown20PercentModal && lowModalEl) {
+                                    hasShown20PercentModal = true;
+                                    sessionStorage.setItem('WARN_20_SHOWN_${username}', '1');
+                                    lowModalEl.style.display = 'flex';
+                                }
+                            }
                         }
                     }, 1000);
 
@@ -2184,7 +2270,34 @@ exports.handler = async (event) => {
                                 renderQuota();
                             }
                         }).catch(() => {});
-                    }, 10000);
+                    }, 8000);
+
+                    // TỰ ĐỘNG PHÁT HIỆN NẾU BỊ VĂNG RA MÀN HÌNH ĐĂNG NHẬP CỦA WEB GỐC -> HIỆN THÔNG BÁO & TỰ LOAD LẠI LUÔN
+                    let reloadTriggered = false;
+                    function checkLoggedOutScreenAndAutoReload() {
+                        if (reloadTriggered) return;
+                        const bodyText = document.body ? (document.body.innerText || '') : '';
+                        const hasLoginBtn = Array.from(document.querySelectorAll('a, button')).some(el => {
+                            const t = (el.textContent || '').trim();
+                            return t === 'Đăng nhập' || t === 'Tạo tài khoản';
+                        });
+                        if (hasLoginBtn || bodyText.includes('Tạo video và ảnh cho shop của bạn')) {
+                            const lastReload = parseInt(sessionStorage.getItem('AUTO_RELOAD_TS') || '0', 10);
+                            if (Date.now() - lastReload > 4000) {
+                                reloadTriggered = true;
+                                sessionStorage.setItem('AUTO_RELOAD_TS', String(Date.now()));
+                                if (syncOverlayEl) syncOverlayEl.style.display = 'flex';
+                                origFetch('/sub-status?active=1').finally(() => {
+                                    setTimeout(() => {
+                                        window.location.replace(window.location.pathname + '?_reload_ts=' + Date.now());
+                                    }, 1200);
+                                });
+                            }
+                        }
+                    }
+                    setTimeout(checkLoggedOutScreenAndAutoReload, 900);
+                    setTimeout(checkLoggedOutScreenAndAutoReload, 2500);
+                    setInterval(checkLoggedOutScreenAndAutoReload, 4000);
 
                     document.addEventListener('click', function(e) {
                         const btn = e.target.closest('button');
@@ -2229,7 +2342,7 @@ exports.handler = async (event) => {
                     let cleanTimer = null;
                     function c() {
                         document.querySelectorAll('a:not([data-cleaned]), button:not([data-cleaned]), span:not([data-cleaned])').forEach(el => {
-                            if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar') || el.closest('#vip-chat-modal') || el.id === 'vip-chat-launcher') {
+                            if (el.id === 'custom-timer-bar' || el.closest('#custom-timer-bar') || el.closest('#vip-chat-modal') || el.id === 'vip-chat-launcher' || el.closest('#low-time-modal') || el.id === 'low-time-strip') {
                                 el.setAttribute('data-cleaned', '1');
                                 return;
                             }
@@ -2265,6 +2378,7 @@ exports.handler = async (event) => {
                 statusCode: response.status,
                 headers: {
                     'content-type': 'text/html; charset=utf-8',
+                    'cache-control': 'no-store, no-cache, must-revalidate',
                     'Set-Cookie': getConfigSyncCookie()
                 },
                 body: html.replace('</body>', shield + '</body>')
