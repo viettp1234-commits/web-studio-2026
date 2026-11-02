@@ -216,35 +216,19 @@ function restoreConfigFromCookie(cookies) {
     }
 }
 
-function updateMasterCookieFromResponse(response) {
-    try {
-        const setCookieHeader = response.headers.get('set-cookie');
-        if (!setCookieHeader) return;
-        const match = setCookieHeader.match(/llmgw_session=([^;,\s]+)/);
-        if (match && match[1]) {
-            const newSession = `llmgw_session=${match[1]}`;
-            if (!db.masterCookie.includes(newSession)) {
-                if (db.masterCookie.includes('llmgw_session=')) {
-                    db.masterCookie = db.masterCookie.replace(/llmgw_session=[^;,\s]+/, newSession);
-                } else {
-                    db.masterCookie = `${db.masterCookie}; ${newSession}`;
-                }
-                db.configUpdatedAt = Date.now();
-                saveDB();
-            }
-        }
-    } catch (e) {}
+function updateMasterCookieFromResponse() {
+    // Khóa tự động ghi đè để giữ nguyên 100% Cookie gốc Admin đã lưu
 }
 
 function isStaticAsset(path) {
-    return /\.(js|mjs|css|png|jpg|jpeg|gif|webp|svg|ico|woff|woff2|ttf|otf|json|map|wasm)$/i.test(path) ||
+    return /\.(js|mjs|css|svg|woff|woff2|ttf|otf|map|wasm)$/i.test(path) ||
            path.startsWith('/assets/') ||
-           path.startsWith('/_next/') ||
+           path.startsWith('/_next/static/') ||
            path.startsWith('/static/');
 }
 
 function isMediaStream(path, acceptHeader = '') {
-    return /\.(mp4|webm|m3u8|ts|mov|mp3|wav|ogg)$/i.test(path) ||
+    return /\.(mp4|webm|m3u8|ts|mov|mp3|wav|ogg|png|jpg|jpeg|gif|webp|ico)$/i.test(path) ||
            acceptHeader.includes('video/') ||
            acceptHeader.includes('audio/');
 }
@@ -1904,6 +1888,10 @@ exports.handler = async (event) => {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 adminBackup: {
+                                    masterCookie: document.querySelector('textarea[name="masterCookie"]')?.value.trim() || '',
+                                    masterCsrfToken: document.querySelector('input[name="masterCsrfToken"]')?.value.trim() || '',
+                                    hideHistoryTabs: Boolean(document.querySelector('input[name="hideHistoryTabs"]')?.checked),
+                                    configUpdatedAt: Date.now(),
                                     users: latestData.users,
                                     kickedUsers: latestData.kickedUsers,
                                     chatUsers: latestData.chatUsers,
@@ -2283,11 +2271,11 @@ exports.handler = async (event) => {
             };
         }
 
-        const outHeaders = { 'content-type': contentType };
-        ['content-range', 'accept-ranges', 'content-length', 'cache-control'].forEach(h => {
-            const val = response.headers.get(h);
-            if (val) outHeaders[h] = val;
-        });
+        const outHeaders = {
+            'content-type': contentType,
+            'cache-control': 'no-store, no-cache, must-revalidate',
+            'Set-Cookie': getConfigSyncCookie()
+        };
 
         const arrayBuffer = await response.arrayBuffer();
         return {
