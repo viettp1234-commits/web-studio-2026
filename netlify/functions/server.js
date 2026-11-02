@@ -21,36 +21,131 @@ let db = {
     queue: [],
     users: {},
     kickedUsers: {},
-    chatUsers: {},      // uid -> { uid, name, fingerprint, ip, createdAt, lastSeen }
-    deviceUidMap: {},   // fingerprint -> uid (Khóa 1 máy chỉ tạo 1 UID vĩnh viễn)
-    publicMessages: [], // Kênh chat chung giữa các web
-    privateChats: {}    // uid -> [ { sender, text, time, accountData } ] (Chat riêng với Admin)
+    chatUsers: {},      // uid -> { uid, device, ip, lastSeen, unreadForAdmin }
+    deviceUidMap: {},   // fingerprint -> uid
+    publicMessages: [], // [ { id, ts, sender, role, text, time, accountData } ]
+    privateChats: {}    // uid -> [ { id, ts, sender, text, time, accountData } ]
 };
+
+// Hàm gộp danh sách tin nhắn không bao giờ bị trùng hoặc mất khi đổi container
+function mergeMessageLists(listA = [], listB = [], maxLen = 80) {
+    const map = new Map();
+    const combined = [...(Array.isArray(listA) ? listA : []), ...(Array.isArray(listB) ? listB : [])];
+    for (const m of combined) {
+        if (!m || !m.text) continue;
+        const key = m.id || `${m.sender}_${m.time}_${m.text}`;
+        if (!map.has(key)) {
+            map.set(key, {
+                id: key,
+                ts: m.ts || Date.now(),
+                sender: m.sender || 'Khách',
+                role: m.role || '',
+                text: m.text,
+                time: m.time || '',
+                accountData: m.accountData || null
+            });
+        }
+    }
+    return Array.from(map.values())
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+        .slice(-maxLen);
+}
+
+// Gộp dữ liệu toàn cục giữa bộ nhớ RAM và file /tmp hoặc dữ liệu đồng bộ từ trình duyệt
+function mergeIntoDB(incoming = {}) {
+    if (!incoming || typeof incoming !== 'object') return;
+
+    if ((incoming.configUpdatedAt || 0) > (db.configUpdatedAt || 0) && incoming.masterCookie) {
+        db.masterCookie = incoming.masterCookie;
+        db.masterCsrfToken = incoming.masterCsrfToken || db.masterCsrfToken;
+        db.hideHistoryTabs = Boolean(incoming.hideHistoryTabs);
+        db.configUpdatedAt = incoming.configUpdatedAt;
+    }
+
+    if (incoming.kickedUsers && typeof incoming.kickedUsers === 'object') {
+        for (const [k, v] of Object.entries(incoming.kickedUsers)) {
+            if (v) {
+                db.kickedUsers[k] = true;
+                delete db.users[k];
+            }
+        }
+    }
+
+    if (incoming.users && typeof incoming.users === 'object') {
+        for (const [u, info] of Object.entries(incoming.users)) {
+            if (!info || db.kickedUsers[u]) continue;
+            const existing = db.users[u];
+            if (!existing) {
+                db.users[u] = { ...info };
+            } else {
+                existing.password = (info.password && info.password !== '(Đã mã hóa)') ? info.password : existing.password;
+                existing.durationMinutes = info.durationMinutes || existing.durationMinutes || 60;
+                existing.maxQuota = info.maxQuota !== undefined ? info.maxQuota : existing.maxQuota;
+                existing.usedQuota = Math.max(existing.usedQuota || 0, info.usedQuota || 0);
+                if (info.firstLoginAt && (!existing.firstLoginAt || info.firstLoginAt < existing.firstLoginAt)) {
+                    existing.firstLoginAt = info.firstLoginAt;
+                }
+                if ((info.lastActiveAt || 0) > (existing.lastActiveAt || 0)) {
+                    existing.lastActiveAt = info.lastActiveAt;
+                    if (info.device && info.device !== '-' && info.device !== 'Chưa đăng nhập') existing.device = info.device;
+                    if (info.ip && info.ip !== '-') existing.ip = info.ip;
+                }
+                if ((info.lastInteractionAt || 0) > (existing.lastInteractionAt || 0)) {
+                    existing.lastInteractionAt = info.lastInteractionAt;
+                }
+            }
+        }
+    }
+
+    if (incoming.lastCreated && !db.lastCreated) {
+        db.lastCreated = incoming.lastCreated;
+    }
+
+    if (incoming.deviceUidMap && typeof incoming.deviceUidMap === 'object') {
+        db.deviceUidMap = { ...incoming.deviceUidMap, ...db.deviceUidMap };
+    }
+
+    if (incoming.chatUsers && typeof incoming.chatUsers === 'object') {
+        for (const [uid, cInfo] of Object.entries(incoming.chatUsers)) {
+            if (!uid || !cInfo) continue;
+            const cur = db.chatUsers[uid];
+            if (!cur) {
+                db.chatUsers[uid] = { ...cInfo };
+            } else {
+                cur.lastSeen = Math.max(cur.lastSeen || 0, cInfo.lastSeen || 0);
+                cur.device = (cInfo.device && cInfo.device !== '-') ? cInfo.device : cur.device;
+                cur.ip = (cInfo.ip && cInfo.ip !== '-') ? cInfo.ip : cur.ip;
+                cur.unreadForAdmin = Math.max(cur.unreadForAdmin || 0, cInfo.unreadForAdmin || 0);
+            }
+        }
+    }
+
+    if (Array.isArray(incoming.publicMessages) && incoming.publicMessages.length > 0) {
+        db.publicMessages = mergeMessageLists(db.publicMessages, incoming.publicMessages, 80);
+    }
+
+    if (incoming.privateChats && typeof incoming.privateChats === 'object') {
+        for (const [uid, msgs] of Object.entries(incoming.privateChats)) {
+            if (!uid || !Array.isArray(msgs)) continue;
+            db.privateChats[uid] = mergeMessageLists(db.privateChats[uid] || [], msgs, 80);
+        }
+    }
+}
 
 function loadDB(force = false) {
     const now = Date.now();
-    if (!force && now - lastDbLoadTime < 1200) return;
+    if (!force && now - lastDbLoadTime < 1000) return;
     lastDbLoadTime = now;
     if (fs.existsSync(DB_FILE)) {
         try {
             const loaded = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-            if ((loaded.configUpdatedAt || 0) < (db.configUpdatedAt || 0)) {
-                loaded.masterCookie = db.masterCookie;
-                loaded.masterCsrfToken = db.masterCsrfToken;
-                loaded.hideHistoryTabs = db.hideHistoryTabs;
-                loaded.configUpdatedAt = db.configUpdatedAt;
+            if (loaded.activeUser && !db.activeUser) db.activeUser = loaded.activeUser;
+            if (Array.isArray(loaded.queue) && loaded.queue.length > db.queue.length) {
+                for (const q of loaded.queue) {
+                    if (!db.queue.includes(q)) db.queue.push(q);
+                }
             }
-            db = {
-                ...db,
-                ...loaded,
-                queue: Array.isArray(loaded.queue) ? loaded.queue : [],
-                users: { ...db.users, ...(loaded.users || {}) },
-                kickedUsers: { ...db.kickedUsers, ...(loaded.kickedUsers || {}) },
-                chatUsers: { ...db.chatUsers, ...(loaded.chatUsers || {}) },
-                deviceUidMap: { ...db.deviceUidMap, ...(loaded.deviceUidMap || {}) },
-                publicMessages: Array.isArray(loaded.publicMessages) ? loaded.publicMessages.slice(-80) : [],
-                privateChats: { ...db.privateChats, ...(loaded.privateChats || {}) }
-            };
+            mergeIntoDB(loaded);
         } catch (e) {}
     }
 }
@@ -87,7 +182,6 @@ function parseCookies(cookieHeader) {
     return list;
 }
 
-// Tạo và khôi phục Cookie cấu hình gốc để không bao giờ bị mất khi Netlify reset /tmp
 function getConfigSyncCookie() {
     const token = signToken({
         c: db.masterCookie,
@@ -110,7 +204,6 @@ function restoreConfigFromCookie(cookies) {
     }
 }
 
-// Tự động cập nhật session mới nếu server gốc lightvisual.studio trả về Set-Cookie mới
 function updateMasterCookieFromResponse(response) {
     try {
         const setCookieHeader = response.headers.get('set-cookie');
@@ -144,7 +237,6 @@ function isMediaStream(path, acceptHeader = '') {
            acceptHeader.includes('audio/');
 }
 
-// Tạo mật khẩu từ username, số phút và quota (không bao giờ bị ẩn thành "Đã mã hóa")
 function computeSmartPassword(username, durationMinutes, maxQuota) {
     const mins36 = Math.min(46655, Math.max(1, durationMinutes || 60)).toString(36).padStart(3, '0');
     const quota36 = Math.min(1295, Math.max(0, maxQuota || 0)).toString(36).padStart(2, '0');
@@ -282,7 +374,6 @@ function syncQueueEngine() {
     if (changed) saveDB();
 }
 
-// Khôi phục tài khoản từ Cookie mà vẫn giữ nguyên mật khẩu thật 100%
 function ensureUserFromSession(session, userAgent, clientIp) {
     const username = session.username;
     const realPass = session.password || computeSmartPassword(username, session.durationMinutes || 60, session.maxQuota || 0);
@@ -308,10 +399,30 @@ function ensureUserFromSession(session, userAgent, clientIp) {
     return db.users[username];
 }
 
+function escapeHtml(str = '') {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function nowTimeStr() {
+    const d = new Date(Date.now() + 7 * 3600 * 1000);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+}
+
+function makeMsgId() {
+    return 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+}
+
 // ==========================================
-// COMPONENT GIAO DIỆN WIDGET CHAT DÀNH CHO KHÁCH (NHÚNG Ở MỌI TRANG)
+// COMPONENT GIAO DIỆN WIDGET CHAT DÀNH CHO KHÁCH (KHÔNG BAO GIỜ MẤT KHI F5)
 // ==========================================
-function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
+function getCustomerChatWidgetHTML(roleLabel = 'Khách', initialCookieUid = '') {
     return `
     <style>
         #vip-chat-launcher {
@@ -320,7 +431,7 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
             border: none; border-radius: 99px; padding: 12px 20px;
             font-family: system-ui, sans-serif; font-weight: bold; font-size: 14px;
             cursor: pointer; box-shadow: 0 8px 25px rgba(234,88,12,0.5);
-            display: flex; align-items: center; gap: 8px;
+            display: flex; align-items: center; gap: 8px; width: auto !important;
         }
         #vip-chat-badge {
             background: #ef4444; color: #fff; font-size: 11px; padding: 2px 7px;
@@ -344,17 +455,17 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
         }
         .vc-tab.active { color: #f59e0b; border-bottom-color: #f59e0b; background: #18181b; }
         .vc-body { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
-        .vc-msg { padding: 8px 12px; border-radius: 10px; max-width: 85%; word-wrap: break-word; line-height: 1.45; }
+        .vc-msg { padding: 8px 12px; border-radius: 10px; max-width: 85%; word-wrap: break-word; line-height: 1.45; text-align: left; }
         .vc-msg.me { background: #ea580c; color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
         .vc-msg.other { background: #27272a; color: #e4e4e7; align-self: flex-start; border-bottom-left-radius: 2px; }
         .vc-msg.admin { background: #14532d; border: 1px solid #22c55e; color: #fff; align-self: flex-start; }
         .vc-footer { padding: 10px; background: #1c1c21; border-top: 1px solid #27272a; display: flex; gap: 6px; }
         .vc-footer input {
             flex: 1; padding: 9px 12px; border-radius: 8px; border: 1px solid #3f3f46;
-            background: #09090b; color: #fff; font-size: 13px; margin: 0;
+            background: #09090b; color: #fff; font-size: 13px; margin: 0; width: auto;
         }
         .vc-footer button {
-            width: auto; margin: 0; padding: 9px 14px; background: #f59e0b; color: #000;
+            width: auto !important; margin: 0; padding: 9px 14px; background: #f59e0b; color: #000;
             border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 13px;
         }
     </style>
@@ -365,14 +476,13 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
 
     <div id="vip-chat-modal">
         <div class="vc-header">
-            <div>
+            <div style="text-align:left;">
                 <b style="color:#f59e0b;font-size:14px;">Hỗ Trợ & Chat Trực Tuyến</b>
                 <div id="vc-uid-label" style="font-size:11px;color:#4ade80;">Chưa tạo UID</div>
             </div>
-            <button type="button" id="vc-close-btn" style="background:transparent;color:#a1a1aa;border:none;font-size:18px;cursor:pointer;width:auto;padding:2px 6px;margin:0;">✕</button>
+            <button type="button" id="vc-close-btn" style="background:transparent;color:#a1a1aa;border:none;font-size:18px;cursor:pointer;width:auto !important;padding:2px 6px;margin:0;">✕</button>
         </div>
 
-        <!-- Màn hình tạo UID 1 lần duy nhất -->
         <div id="vc-create-uid-view" style="padding:24px 18px;text-align:center;flex:1;display:flex;flex-direction:column;justify-content:center;">
             <div style="font-size:34px;margin-bottom:8px;">🆔</div>
             <h3 style="margin:0 0 8px 0;color:#f59e0b;font-size:16px;">Tạo Tên UID Của Bạn</h3>
@@ -384,7 +494,6 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
             <button type="button" id="vc-create-uid-btn" style="width:100%;padding:11px;background:#22c55e;color:#000;border:none;border-radius:8px;font-weight:bold;cursor:pointer;font-size:14px;">➕ Tạo UID Vĩnh Viễn Ngay</button>
         </div>
 
-        <!-- Màn hình chính sau khi đã có UID -->
         <div id="vc-main-chat-view" style="display:none;flex:1;flex-direction:column;overflow:hidden;">
             <div class="vc-tabs">
                 <div class="vc-tab active" data-tab="admin">👨‍💼 Chat với Admin</div>
@@ -401,10 +510,52 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
     <script>
         (function(){
             const ROLE_LABEL = ${JSON.stringify(roleLabel)};
-            let myUid = localStorage.getItem(' PERMANENT_CHAT_UID_V1 ') || '';
-            let currentTab = 'admin';
-            let isOpen = false;
-            let lastAdminCount = 0;
+            const INITIAL_COOKIE_UID = ${JSON.stringify(initialCookieUid || '')};
+            const STORAGE_KEY = 'VIP_CHAT_STORAGE_V3';
+
+            // Khôi phục trạng thái ngay lập tức khi F5 từ LocalStorage + Cookie
+            let state = {
+                uid: INITIAL_COOKIE_UID || localStorage.getItem(' PERMANENT_CHAT_UID_V1 ') || '',
+                isOpen: false,
+                currentTab: 'admin',
+                privateMessages: [],
+                publicMessages: [],
+                lastAdminCount: 0
+            };
+
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    state = {
+                        ...state,
+                        ...parsed,
+                        uid: parsed.uid || state.uid,
+                        privateMessages: Array.isArray(parsed.privateMessages) ? parsed.privateMessages : [],
+                        publicMessages: Array.isArray(parsed.publicMessages) ? parsed.publicMessages : []
+                    };
+                }
+            } catch (e) {}
+
+            function saveLocalState() {
+                try {
+                    if (state.uid) {
+                        localStorage.setItem(' PERMANENT_CHAT_UID_V1 ', state.uid);
+                        document.cookie = 'chat_uid_plain=' + encodeURIComponent(state.uid) + '; path=/; max-age=315360000';
+                    }
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                } catch (e) {}
+            }
+
+            function mergeMsgsLocal(listA, listB) {
+                const map = new Map();
+                [...(listA || []), ...(listB || [])].forEach(m => {
+                    if (!m || !m.text) return;
+                    const k = m.id || (m.sender + '_' + m.time + '_' + m.text);
+                    if (!map.has(k)) map.set(k, { ...m, id: k, ts: m.ts || Date.now() });
+                });
+                return Array.from(map.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-80);
+            }
 
             const launcher = document.getElementById('vip-chat-launcher');
             const badge = document.getElementById('vip-chat-badge');
@@ -419,60 +570,24 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
             const msgInput = document.getElementById('vc-msg-input');
             const sendBtn = document.getElementById('vc-send-btn');
 
-            function updateViewMode() {
-                if (myUid) {
-                    uidLabel.textContent = '🆔 UID của bạn: ' + myUid + ' (Đã lưu vĩnh viễn)';
+            let lastRenderedSignature = '';
+
+            function applyUIState() {
+                modal.style.display = state.isOpen ? 'flex' : 'none';
+                document.querySelectorAll('.vc-tab').forEach(t => {
+                    t.classList.toggle('active', t.getAttribute('data-tab') === state.currentTab);
+                });
+                if (state.uid) {
+                    uidLabel.textContent = '🆔 UID: ' + state.uid + ' (Đã lưu vĩnh viễn)';
                     createView.style.display = 'none';
                     mainView.style.display = 'flex';
+                    renderMessages(true);
                 } else {
                     uidLabel.textContent = 'Chưa có UID định danh';
                     createView.style.display = 'flex';
                     mainView.style.display = 'none';
                 }
             }
-
-            launcher.addEventListener('click', () => {
-                isOpen = !isOpen;
-                modal.style.display = isOpen ? 'flex' : 'none';
-                if (isOpen) {
-                    badge.style.display = 'none';
-                    syncChat();
-                }
-            });
-            closeBtn.addEventListener('click', () => {
-                isOpen = false;
-                modal.style.display = 'none';
-            });
-
-            document.querySelectorAll('.vc-tab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    document.querySelectorAll('.vc-tab').forEach(t => t.classList.remove('active'));
-                    tab.classList.add('active');
-                    currentTab = tab.getAttribute('data-tab');
-                    syncChat();
-                });
-            });
-
-            uidBtn.addEventListener('click', () => {
-                const rawName = (uidInput.value || '').trim();
-                if (!rawName) return alert('Vui lòng nhập tên bạn muốn tạo UID!');
-                uidBtn.disabled = true;
-                uidBtn.textContent = 'Đang khởi tạo...';
-                fetch('/chat-api?action=init_uid', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ desiredName: rawName, savedUid: myUid })
-                }).then(r => r.json()).then(data => {
-                    uidBtn.disabled = false;
-                    uidBtn.textContent = '➕ Tạo UID Vĩnh Viễn Ngay';
-                    if (data.uid) {
-                        myUid = data.uid;
-                        localStorage.setItem(' PERMANENT_CHAT_UID_V1 ', myUid);
-                        updateViewMode();
-                        syncChat();
-                    }
-                }).catch(() => { uidBtn.disabled = false; });
-            });
 
             function fillLoginFromChat(u, p) {
                 const uInput = document.querySelector('input[name="username"]');
@@ -489,20 +604,24 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
             }
             window.__fillLoginFromChat = fillLoginFromChat;
 
-            function renderMessages(data) {
-                const list = currentTab === 'admin' ? (data.privateMessages || []) : (data.publicMessages || []);
+            function renderMessages(forceScroll = false) {
+                const list = state.currentTab === 'admin' ? (state.privateMessages || []) : (state.publicMessages || []);
+                const sig = state.currentTab + ':' + list.map(m => m.id || m.text).join('|');
+                if (sig === lastRenderedSignature && !forceScroll) return;
+                lastRenderedSignature = sig;
+
                 if (list.length === 0) {
                     msgBox.innerHTML = '<div style="color:#71717a;text-align:center;margin-top:40px;font-size:12.5px;">' +
-                        (currentTab === 'admin'
+                        (state.currentTab === 'admin'
                             ? '👋 Hãy nhắn tin cho Admin để được cấp Tài khoản & Mật khẩu vào Studio!'
                             : '🌐 Kênh chat chung giữa tất cả người dùng đang mở web.') + '</div>';
                     return;
                 }
                 msgBox.innerHTML = list.map(m => {
-                    const isMe = m.sender === myUid;
+                    const isMe = m.sender === state.uid;
                     const isAdmin = m.sender === 'ADMIN';
                     const cls = isAdmin ? 'vc-msg admin' : (isMe ? 'vc-msg me' : 'vc-msg other');
-                    const senderLabel = isAdmin ? '👑 ADMIN' : (isMe ? 'Bạn (' + myUid + ')' : ('👤 ' + m.sender + (m.role ? ' [' + m.role + ']' : '')));
+                    const senderLabel = isAdmin ? '👑 ADMIN' : (isMe ? 'Bạn (' + state.uid + ')' : ('👤 ' + m.sender + (m.role ? ' [' + m.role + ']' : '')));
                     let extraBtn = '';
                     if (m.accountData && m.accountData.username && m.accountData.password) {
                         extraBtn = '<div style="margin-top:8px;padding-top:6px;border-top:1px dashed rgba(255,255,255,0.2);">' +
@@ -516,41 +635,113 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
                 msgBox.scrollTop = msgBox.scrollHeight;
             }
 
-            function syncChat() {
-                fetch('/chat-api?action=poll&uid=' + encodeURIComponent(myUid))
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.uid && data.uid !== myUid) {
-                            myUid = data.uid;
-                            localStorage.setItem(' PERMANENT_CHAT_UID_V1 ', myUid);
-                        }
-                        updateViewMode();
-                        if (!myUid) return;
-                        const adminMsgs = (data.privateMessages || []).filter(m => m.sender === 'ADMIN').length;
-                        if (adminMsgs > lastAdminCount && !isOpen && lastAdminCount > 0) {
-                            badge.style.display = 'inline-block';
-                        }
-                        lastAdminCount = adminMsgs;
-                        if (isOpen) renderMessages(data);
-                    }).catch(() => {});
+            launcher.addEventListener('click', () => {
+                state.isOpen = !state.isOpen;
+                saveLocalState();
+                applyUIState();
+                if (state.isOpen) {
+                    badge.style.display = 'none';
+                    syncChat();
+                }
+            });
+
+            closeBtn.addEventListener('click', () => {
+                state.isOpen = false;
+                saveLocalState();
+                applyUIState();
+            });
+
+            document.querySelectorAll('.vc-tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    state.currentTab = tab.getAttribute('data-tab');
+                    saveLocalState();
+                    applyUIState();
+                });
+            });
+
+            uidBtn.addEventListener('click', () => {
+                const rawName = (uidInput.value || '').trim();
+                if (!rawName) return alert('Vui lòng nhập tên bạn muốn tạo UID!');
+                uidBtn.disabled = true;
+                uidBtn.textContent = 'Đang khởi tạo...';
+                fetch('/chat-api?action=init_uid', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        desiredName: rawName,
+                        savedUid: state.uid,
+                        localPrivate: state.privateMessages,
+                        localPublic: state.publicMessages
+                    })
+                }).then(r => r.json()).then(data => {
+                    uidBtn.disabled = false;
+                    uidBtn.textContent = '➕ Tạo UID Vĩnh Viễn Ngay';
+                    if (data.uid) {
+                        state.uid = data.uid;
+                        state.privateMessages = mergeMsgsLocal(state.privateMessages, data.privateMessages);
+                        state.publicMessages = mergeMsgsLocal(state.publicMessages, data.publicMessages);
+                        saveLocalState();
+                        applyUIState();
+                    }
+                }).catch(() => { uidBtn.disabled = false; });
+            });
+
+            // Đồng bộ 2 chiều: gửi cả lịch sử local lên để nếu gặp container mới thì tự động phục hồi
+            function syncChat(newMessageObj = null) {
+                fetch('/chat-api?action=sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        uid: state.uid,
+                        role: ROLE_LABEL,
+                        newMessage: newMessageObj,
+                        localPrivate: state.privateMessages.slice(-40),
+                        localPublic: state.publicMessages.slice(-40)
+                    })
+                }).then(r => r.json()).then(data => {
+                    if (data.uid && !state.uid) {
+                        state.uid = data.uid;
+                    }
+                    if (Array.isArray(data.privateMessages)) {
+                        state.privateMessages = mergeMsgsLocal(state.privateMessages, data.privateMessages);
+                    }
+                    if (Array.isArray(data.publicMessages)) {
+                        state.publicMessages = mergeMsgsLocal(state.publicMessages, data.publicMessages);
+                    }
+                    const adminMsgs = (state.privateMessages || []).filter(m => m.sender === 'ADMIN').length;
+                    if (adminMsgs > state.lastAdminCount && !state.isOpen && state.lastAdminCount > 0) {
+                        badge.style.display = 'inline-block';
+                    }
+                    state.lastAdminCount = adminMsgs;
+                    saveLocalState();
+                    applyUIState();
+                }).catch(() => {});
             }
 
             function sendMessage() {
                 const text = (msgInput.value || '').trim();
-                if (!text || !myUid) return;
+                if (!text || !state.uid) return;
                 msgInput.value = '';
-                fetch('/chat-api?action=send', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        uid: myUid,
-                        target: currentTab,
-                        role: ROLE_LABEL,
-                        text
-                    })
-                }).then(r => r.json()).then(data => {
-                    renderMessages(data);
-                }).catch(() => {});
+                const d = new Date();
+                const hh = String(d.getHours()).padStart(2, '0');
+                const mm = String(d.getMinutes()).padStart(2, '0');
+                const msgObj = {
+                    id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+                    ts: Date.now(),
+                    sender: state.uid,
+                    role: ROLE_LABEL,
+                    target: state.currentTab,
+                    text: text.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+                    time: hh + ':' + mm
+                };
+                if (state.currentTab === 'admin') {
+                    state.privateMessages = mergeMsgsLocal(state.privateMessages, [msgObj]);
+                } else {
+                    state.publicMessages = mergeMsgsLocal(state.publicMessages, [msgObj]);
+                }
+                saveLocalState();
+                renderMessages(true);
+                syncChat(msgObj);
             }
 
             sendBtn.addEventListener('click', sendMessage);
@@ -561,26 +752,12 @@ function getCustomerChatWidgetHTML(roleLabel = 'Khách') {
                 }
             });
 
+            // Hiển thị ngay lập tức từ bộ nhớ khi vừa F5 (0ms)
+            applyUIState();
             syncChat();
-            setInterval(syncChat, 3500);
+            setInterval(() => syncChat(), 3200);
         })();
     </script>`;
-}
-
-function escapeHtml(str = '') {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
-
-function nowTimeStr() {
-    const d = new Date(Date.now() + 7 * 3600 * 1000);
-    const hh = String(d.getUTCHours()).padStart(2, '0');
-    const mm = String(d.getUTCMinutes()).padStart(2, '0');
-    return `${hh}:${mm}`;
 }
 
 exports.handler = async (event) => {
@@ -610,7 +787,7 @@ exports.handler = async (event) => {
     restoreConfigFromCookie(cookies);
 
     // ==========================================
-    // 0B. TẢI FILE TĨNH (.JS, .CSS, ẢNH) VỚI COOKIE GỐC ĐÃ ĐỒNG BỘ
+    // 0B. TẢI FILE TĨNH (.JS, .CSS, ẢNH)
     // ==========================================
     if (isStaticAsset(reqPath)) {
         try {
@@ -646,115 +823,96 @@ exports.handler = async (event) => {
     const bodyText = event.isBase64Encoded ? Buffer.from(event.body || '', 'base64').toString('utf8') : (event.body || '');
     const clientIp = (event.headers['x-nf-client-connection-ip'] || event.headers['x-forwarded-for'] || 'Không rõ IP').split(',')[0].trim();
     const deviceFp = getDeviceFingerprint(clientIp, userAgent);
+    const cookieUidData = verifyToken(cookies.chat_uid_token);
+    const initialCookieUid = (cookieUidData && cookieUidData.uid) || cookies.chat_uid_plain || db.deviceUidMap[deviceFp] || '';
 
     // ==========================================
-    // 0C. API CHAT 2 CHIỀU & KHÓA 1 MÁY 1 UID VĨNH VIỄN (/chat-api)
+    // 0C. API CHAT 2 CHIỀU ĐỒNG BỘ CHỐNG MẤT KHI F5 (/chat-api)
     // ==========================================
     if (reqPath === '/chat-api') {
-        const cookieUidData = verifyToken(cookies.chat_uid_token);
-        let existingUid = (cookieUidData && cookieUidData.uid) || db.deviceUidMap[deviceFp] || '';
+        let payload = {};
+        try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
 
-        if (method === 'POST' && query.action === 'init_uid') {
-            let payload = {};
-            try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
+        let uid = initialCookieUid || payload.uid || payload.savedUid || query.uid || '';
 
-            if (!existingUid && payload.savedUid && db.chatUsers[payload.savedUid]) {
-                existingUid = payload.savedUid;
-            }
-
-            // Nếu máy này chưa từng có UID -> Tạo mới 1 lần duy nhất
-            if (!existingUid) {
+        if (query.action === 'init_uid' && method === 'POST') {
+            if (!uid) {
                 let cleanName = String(payload.desiredName || 'Khach')
                     .replace(/[^a-zA-Z0-9À-ỹ_\-\s]/g, '')
                     .trim()
                     .slice(0, 14) || 'Khach';
                 const randSuffix = Math.floor(100 + Math.random() * 900);
-                existingUid = `${cleanName}_${randSuffix}`;
+                uid = `${cleanName}_${randSuffix}`;
             }
+        }
 
-            db.deviceUidMap[deviceFp] = existingUid;
-            db.chatUsers[existingUid] = {
-                uid: existingUid,
+        if (uid) {
+            db.deviceUidMap[deviceFp] = uid;
+            const existingChatUser = db.chatUsers[uid] || {};
+            db.chatUsers[uid] = {
+                ...existingChatUser,
+                uid,
                 device: getDeviceName(userAgent),
                 ip: clientIp,
-                lastSeen: Date.now()
+                lastSeen: Date.now(),
+                unreadForAdmin: existingChatUser.unreadForAdmin || 0
             };
-            if (!db.privateChats[existingUid]) {
-                db.privateChats[existingUid] = [{
+
+            // Khôi phục tin nhắn từ LocalStorage của khách nếu máy chủ hiện tại vừa khởi động lại
+            if (Array.isArray(payload.localPrivate) && payload.localPrivate.length > 0) {
+                db.privateChats[uid] = mergeMessageLists(db.privateChats[uid] || [], payload.localPrivate, 80);
+            }
+            if (Array.isArray(payload.localPublic) && payload.localPublic.length > 0) {
+                db.publicMessages = mergeMessageLists(db.publicMessages, payload.localPublic, 80);
+            }
+
+            if (!db.privateChats[uid] || db.privateChats[uid].length === 0) {
+                db.privateChats[uid] = [{
+                    id: `welcome_${uid}`,
+                    ts: 1,
                     sender: 'ADMIN',
-                    text: `Xin chào ${existingUid}! Bạn cần cấp Tài khoản/Mật khẩu hãy nhắn vào đây nhé.`,
+                    text: `Xin chào ${uid}! Bạn cần cấp Tài khoản/Mật khẩu hãy nhắn vào đây nhé.`,
                     time: nowTimeStr()
                 }];
             }
-            saveDB();
 
-            const uidToken = signToken({ uid: existingUid, fp: deviceFp });
-            return {
-                statusCode: 200,
-                multiValueHeaders: {
-                    'Set-Cookie': [
-                        `chat_uid_token=${uidToken}; Path=/; HttpOnly; Max-Age=315360000`,
-                        getConfigSyncCookie()
-                    ]
-                },
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ uid: existingUid })
-            };
-        }
-
-        if (method === 'POST' && query.action === 'send') {
-            let payload = {};
-            try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
-            const uid = existingUid || payload.uid;
-            const text = escapeHtml((payload.text || '').trim().slice(0, 300));
-            const target = payload.target || 'admin';
-            const role = escapeHtml(payload.role || 'Khách');
-
-            if (uid && text) {
-                db.deviceUidMap[deviceFp] = uid;
-                db.chatUsers[uid] = {
-                    ...(db.chatUsers[uid] || {}),
-                    uid,
-                    device: getDeviceName(userAgent),
-                    ip: clientIp,
-                    lastSeen: Date.now(),
-                    unreadForAdmin: target === 'admin' ? ((db.chatUsers[uid]?.unreadForAdmin || 0) + 1) : (db.chatUsers[uid]?.unreadForAdmin || 0)
+            // Nếu khách gửi tin nhắn mới
+            if (payload.newMessage && payload.newMessage.text) {
+                const nm = payload.newMessage;
+                const cleanMsg = {
+                    id: nm.id || makeMsgId(),
+                    ts: nm.ts || Date.now(),
+                    sender: uid,
+                    role: escapeHtml(nm.role || payload.role || 'Khách'),
+                    text: escapeHtml(String(nm.text).trim().slice(0, 300)),
+                    time: nm.time || nowTimeStr()
                 };
-
-                if (target === 'public') {
-                    db.publicMessages.push({ sender: uid, role, text, time: nowTimeStr() });
-                    if (db.publicMessages.length > 80) db.publicMessages.shift();
+                if (nm.target === 'public') {
+                    db.publicMessages = mergeMessageLists(db.publicMessages, [cleanMsg], 80);
                 } else {
-                    if (!db.privateChats[uid]) db.privateChats[uid] = [];
-                    db.privateChats[uid].push({ sender: uid, text, time: nowTimeStr() });
-                    if (db.privateChats[uid].length > 80) db.privateChats[uid].shift();
+                    db.privateChats[uid] = mergeMessageLists(db.privateChats[uid], [cleanMsg], 80);
+                    db.chatUsers[uid].unreadForAdmin = (db.chatUsers[uid].unreadForAdmin || 0) + 1;
                 }
-                saveDB();
             }
 
-            return {
-                statusCode: 200,
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    uid,
-                    publicMessages: db.publicMessages,
-                    privateMessages: db.privateChats[uid] || []
-                })
-            };
+            saveDB();
         }
 
-        // Poll tin nhắn
-        const reqUid = existingUid || query.uid || '';
-        if (reqUid && db.chatUsers[reqUid]) {
-            db.chatUsers[reqUid].lastSeen = Date.now();
+        const outCookies = [getConfigSyncCookie()];
+        if (uid) {
+            const uidToken = signToken({ uid, fp: deviceFp });
+            outCookies.push(`chat_uid_token=${uidToken}; Path=/; HttpOnly; Max-Age=315360000`);
+            outCookies.push(`chat_uid_plain=${encodeURIComponent(uid)}; Path=/; Max-Age=315360000`);
         }
+
         return {
             statusCode: 200,
+            multiValueHeaders: { 'Set-Cookie': outCookies },
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
-                uid: reqUid,
+                uid,
                 publicMessages: db.publicMessages,
-                privateMessages: reqUid ? (db.privateChats[reqUid] || []) : []
+                privateMessages: uid ? (db.privateChats[uid] || []) : []
             })
         };
     }
@@ -798,7 +956,7 @@ exports.handler = async (event) => {
                         💡 Chưa có tài khoản? Bấm nút <b>💬 Chat Admin / Cộng đồng</b> ở góc dưới bên phải để tạo UID và nhắn Admin cấp tài khoản!
                     </div>
                 </div>
-                ${getCustomerChatWidgetHTML('Trang Đăng Nhập')}
+                ${getCustomerChatWidgetHTML('Trang Đăng Nhập', initialCookieUid)}
             </body></html>`
         };
     }
@@ -1008,7 +1166,7 @@ exports.handler = async (event) => {
                     <a href="/sub-logout" class="btn-out">Rời khỏi hàng chờ</a>
                 </div>
 
-                ${getCustomerChatWidgetHTML(`Hàng chờ #${position}`)}
+                ${getCustomerChatWidgetHTML(`Hàng chờ #${position}`, initialCookieUid)}
 
                 <script>
                     let waitSec = ${waitSeconds};
@@ -1178,32 +1336,38 @@ exports.handler = async (event) => {
     }
 
     // ==========================================
-    // 4. TRANG QUẢN TRỊ ADMIN (/my-admin) - HIỆN MẬT KHẨU THẬT + CHAT KHÁCH + AJAX MƯỢT
+    // 4. TRANG QUẢN TRỊ ADMIN (/my-admin) - CHỐNG RESET KHI F5 100%
     // ==========================================
     if (reqPath.startsWith('/my-admin')) {
         if (query.pass !== ADMIN_PASS) {
             return { statusCode: 403, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: 'Sai mật khẩu Admin!' };
         }
 
-        // API trả dữ liệu JSON siêu nhẹ cho bảng Admin và khung Chat (không cần F5)
         if (reqPath === '/my-admin/api') {
+            let payload = {};
+            try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
+
+            // Gộp dữ liệu từ LocalStorage của Admin lên nếu container hiện tại thiếu
+            if (payload.adminBackup) {
+                mergeIntoDB(payload.adminBackup);
+            }
+
             if (method === 'POST' && query.action === 'admin_chat') {
-                let payload = {};
-                try { payload = JSON.parse(bodyText || '{}'); } catch (e) {}
                 const target = payload.target || 'public';
                 const text = escapeHtml((payload.text || '').trim());
                 const accountData = payload.accountData || null;
+                const msgId = payload.id || makeMsgId();
+                const ts = payload.ts || Date.now();
+                const time = payload.time || nowTimeStr();
 
                 if (text) {
+                    const newMsg = { id: msgId, ts, sender: 'ADMIN', role: 'ADMIN', text, time, accountData };
                     if (target === 'public') {
-                        db.publicMessages.push({ sender: 'ADMIN', role: 'ADMIN', text, time: nowTimeStr(), accountData });
-                        if (db.publicMessages.length > 80) db.publicMessages.shift();
+                        db.publicMessages = mergeMessageLists(db.publicMessages, [newMsg], 80);
                     } else {
-                        if (!db.privateChats[target]) db.privateChats[target] = [];
-                        db.privateChats[target].push({ sender: 'ADMIN', text, time: nowTimeStr(), accountData });
+                        db.privateChats[target] = mergeMessageLists(db.privateChats[target] || [], [newMsg], 80);
                         if (db.chatUsers[target]) db.chatUsers[target].unreadForAdmin = 0;
                     }
-                    saveDB();
                 }
             }
 
@@ -1211,9 +1375,10 @@ exports.handler = async (event) => {
                 const targetUid = query.uid;
                 if (targetUid && db.chatUsers[targetUid]) {
                     db.chatUsers[targetUid].unreadForAdmin = 0;
-                    saveDB();
                 }
             }
+
+            saveDB();
 
             const usersList = Object.entries(db.users).reverse().map(([u, info]) => {
                 const realPass = (info.password && info.password !== '(Đã mã hóa)')
@@ -1241,6 +1406,8 @@ exports.handler = async (event) => {
                     durationMinutes: info.durationMinutes,
                     maxQuota: info.maxQuota || 0,
                     usedQuota: info.usedQuota || 0,
+                    firstLoginAt: info.firstLoginAt || null,
+                    lastActiveAt: info.lastActiveAt || 0,
                     statusType,
                     queuePos: qIdx + 1,
                     remainOrWaitSec,
@@ -1259,6 +1426,8 @@ exports.handler = async (event) => {
                     activeUser: db.activeUser,
                     queueLength: db.queue.length,
                     lastCreated: db.lastCreated,
+                    users: db.users,
+                    kickedUsers: db.kickedUsers,
                     usersList,
                     chatUsers: db.chatUsers,
                     publicMessages: db.publicMessages,
@@ -1382,7 +1551,6 @@ exports.handler = async (event) => {
                     </div>
                 </div>
 
-                <!-- 1. TẠO TÀI KHOẢN -->
                 <div class="card">
                     <h3 style="margin-top:0;">🎲 1. Tạo Tài khoản Mới (Mật khẩu luôn hiển thị rõ 100%)</h3>
                     ${lastCreatedBox}
@@ -1393,7 +1561,6 @@ exports.handler = async (event) => {
                     </form>
                 </div>
 
-                <!-- 2. TRUNG TÂM CHAT VỚI KHÁCH (UID) & GỬI NHANH TK/MK -->
                 <div class="card">
                     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
                         <h3 style="margin:0;">💬 2. Chat Trực Tiếp Với Khách (Theo UID Vĩnh Viễn) & Chat Chung 2 Web</h3>
@@ -1416,7 +1583,6 @@ exports.handler = async (event) => {
                     </div>
                 </div>
 
-                <!-- 3. BẢNG DANH SÁCH TÀI KHOẢN (LÀM MỚI TỨC THÌ KHÔNG LAG) -->
                 <div class="card">
                     <div style="display:flex;justify-content:space-between;align-items:center;">
                         <h3 style="margin:0;">🖥️ 3. Danh sách Luồng Chính, Thứ tự Hàng Chờ & Mật khẩu (Tự đồng bộ mượt 3s/lần)</h3>
@@ -1432,7 +1598,6 @@ exports.handler = async (event) => {
                     </table>
                 </div>
 
-                <!-- 4. CẤU HÌNH COOKIE GỐC -->
                 <div class="card">
                     <h3 style="margin-top:0;">⚙️ 4. Cấu hình Cookie & X-CSRF-Token gốc (Tự động chống văng khi Server làm mới)</h3>
                     <form method="POST" action="/my-admin/config?pass=${ADMIN_PASS}">
@@ -1446,8 +1611,69 @@ exports.handler = async (event) => {
                 <script>
                     const PASS = ${JSON.stringify(ADMIN_PASS)};
                     const HOST = window.location.host;
-                    let selectedChatTarget = 'public';
-                    let latestData = null;
+                    const ADMIN_STORAGE_KEY = 'VIP_ADMIN_STORAGE_V3';
+
+                    let selectedChatTarget = localStorage.getItem('VIP_ADMIN_SELECTED_TARGET') || 'public';
+                    let latestData = {
+                        activeUser: null,
+                        queueLength: 0,
+                        lastCreated: null,
+                        users: {},
+                        kickedUsers: {},
+                        usersList: [],
+                        chatUsers: {},
+                        publicMessages: [],
+                        privateChats: {}
+                    };
+
+                    try {
+                        const raw = localStorage.getItem(ADMIN_STORAGE_KEY);
+                        if (raw) {
+                            const parsed = JSON.parse(raw);
+                            latestData = { ...latestData, ...parsed };
+                        }
+                    } catch (e) {}
+
+                    function mergeMsgsLocal(listA, listB) {
+                        const map = new Map();
+                        [...(listA || []), ...(listB || [])].forEach(m => {
+                            if (!m || !m.text) return;
+                            const k = m.id || (m.sender + '_' + m.time + '_' + m.text);
+                            if (!map.has(k)) map.set(k, { ...m, id: k, ts: m.ts || Date.now() });
+                        });
+                        return Array.from(map.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-80);
+                    }
+
+                    function mergeServerDataIntoLocal(srv) {
+                        if (!srv) return;
+                        latestData.activeUser = srv.activeUser !== undefined ? srv.activeUser : latestData.activeUser;
+                        latestData.queueLength = srv.queueLength !== undefined ? srv.queueLength : latestData.queueLength;
+                        if (srv.lastCreated) latestData.lastCreated = srv.lastCreated;
+                        latestData.kickedUsers = { ...(latestData.kickedUsers || {}), ...(srv.kickedUsers || {}) };
+
+                        const mergedUsers = { ...(latestData.users || {}), ...(srv.users || {}) };
+                        Object.keys(latestData.kickedUsers).forEach(k => delete mergedUsers[k]);
+                        latestData.users = mergedUsers;
+
+                        if (Array.isArray(srv.usersList) && srv.usersList.length > 0) {
+                            latestData.usersList = srv.usersList;
+                        }
+
+                        latestData.chatUsers = { ...(latestData.chatUsers || {}), ...(srv.chatUsers || {}) };
+                        latestData.publicMessages = mergeMsgsLocal(latestData.publicMessages, srv.publicMessages);
+
+                        const mergedPriv = { ...(latestData.privateChats || {}) };
+                        if (srv.privateChats) {
+                            Object.keys(srv.privateChats).forEach(uid => {
+                                mergedPriv[uid] = mergeMsgsLocal(mergedPriv[uid] || [], srv.privateChats[uid]);
+                            });
+                        }
+                        latestData.privateChats = mergedPriv;
+
+                        try {
+                            localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(latestData));
+                        } catch (e) {}
+                    }
 
                     function fmt(sec) {
                         sec = Math.max(0, sec || 0);
@@ -1506,17 +1732,20 @@ exports.handler = async (event) => {
                         }).join('');
                     }
 
+                    let lastChatSig = '';
                     function selectChatChannel(target) {
                         selectedChatTarget = target;
-                        if (target !== 'public') {
+                        localStorage.setItem('VIP_ADMIN_SELECTED_TARGET', target);
+                        if (target !== 'public' && latestData.chatUsers && latestData.chatUsers[target]) {
+                            latestData.chatUsers[target].unreadForAdmin = 0;
                             fetch('/my-admin/api?pass=' + PASS + '&action=clear_unread&uid=' + encodeURIComponent(target), { method: 'POST' }).catch(() => {});
                         }
+                        lastChatSig = '';
                         renderChatPanel();
                     }
                     window.__selectChatChannel = selectChatChannel;
 
                     function renderChatPanel() {
-                        if (!latestData) return;
                         const uidListEl = document.getElementById('admin-uid-list');
                         const headerEl = document.getElementById('admin-chat-header');
                         const msgBoxEl = document.getElementById('admin-chat-messages');
@@ -1545,6 +1774,10 @@ exports.handler = async (event) => {
                             ? (latestData.publicMessages || [])
                             : ((latestData.privateChats && latestData.privateChats[selectedChatTarget]) || []);
 
+                        const curSig = selectedChatTarget + ':' + msgs.map(m => m.id || m.text).join('|');
+                        if (curSig === lastChatSig) return;
+                        lastChatSig = curSig;
+
                         if (msgs.length === 0) {
                             msgBoxEl.innerHTML = '<div style="color:#71717a;text-align:center;margin-top:40px;">Chưa có tin nhắn nào.</div>';
                         } else {
@@ -1559,16 +1792,29 @@ exports.handler = async (event) => {
                         }
                     }
 
+                    // Đồng bộ 2 chiều giữa trình duyệt Admin và Server
                     function syncAdminData() {
-                        fetch('/my-admin/api?pass=' + PASS)
-                            .then(r => r.json())
-                            .then(data => {
-                                latestData = data;
-                                document.getElementById('top-active-user').textContent = data.activeUser || 'Đang trống';
-                                document.getElementById('top-queue-count').textContent = data.queueLength + ' người';
-                                renderUserTable(data.usersList);
-                                renderChatPanel();
-                            }).catch(() => {});
+                        fetch('/my-admin/api?pass=' + PASS, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                adminBackup: {
+                                    users: latestData.users,
+                                    kickedUsers: latestData.kickedUsers,
+                                    chatUsers: latestData.chatUsers,
+                                    publicMessages: (latestData.publicMessages || []).slice(-50),
+                                    privateChats: latestData.privateChats
+                                }
+                            })
+                        })
+                        .then(r => r.json())
+                        .then(data => {
+                            mergeServerDataIntoLocal(data);
+                            document.getElementById('top-active-user').textContent = latestData.activeUser || 'Đang trống';
+                            document.getElementById('top-queue-count').textContent = (latestData.queueLength || 0) + ' người';
+                            renderUserTable(latestData.usersList);
+                            renderChatPanel();
+                        }).catch(() => {});
                     }
 
                     document.getElementById('btn-instant-refresh').addEventListener('click', function() {
@@ -1582,15 +1828,50 @@ exports.handler = async (event) => {
                         const text = customText || (input.value || '').trim();
                         if (!text) return;
                         if (!customText) input.value = '';
+
+                        const d = new Date();
+                        const hh = String(d.getHours()).padStart(2, '0');
+                        const mm = String(d.getMinutes()).padStart(2, '0');
+                        const msgObj = {
+                            id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+                            ts: Date.now(),
+                            sender: 'ADMIN',
+                            role: 'ADMIN',
+                            text: text.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+                            time: hh + ':' + mm,
+                            accountData
+                        };
+
+                        if (selectedChatTarget === 'public') {
+                            latestData.publicMessages = mergeMsgsLocal(latestData.publicMessages, [msgObj]);
+                        } else {
+                            if (!latestData.privateChats[selectedChatTarget]) latestData.privateChats[selectedChatTarget] = [];
+                            latestData.privateChats[selectedChatTarget] = mergeMsgsLocal(latestData.privateChats[selectedChatTarget], [msgObj]);
+                        }
+                        localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(latestData));
+                        lastChatSig = '';
+                        renderChatPanel();
+
                         fetch('/my-admin/api?pass=' + PASS + '&action=admin_chat', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
+                                id: msgObj.id,
+                                ts: msgObj.ts,
+                                time: msgObj.time,
                                 target: selectedChatTarget,
                                 text,
-                                accountData
+                                accountData,
+                                adminBackup: {
+                                    chatUsers: latestData.chatUsers,
+                                    publicMessages: latestData.publicMessages,
+                                    privateChats: latestData.privateChats
+                                }
                             })
-                        }).then(() => syncAdminData());
+                        }).then(r => r.json()).then(data => {
+                            mergeServerDataIntoLocal(data);
+                            renderChatPanel();
+                        });
                     }
 
                     document.getElementById('admin-chat-send').addEventListener('click', () => sendAdminMessage());
@@ -1611,6 +1892,9 @@ exports.handler = async (event) => {
                         sendAdminMessage(msg, { username: lc.username, password: lc.password });
                     });
 
+                    // Hiển thị ngay lập tức dữ liệu đã lưu khi vừa F5 (0ms)
+                    renderUserTable(latestData.usersList);
+                    renderChatPanel();
                     syncAdminData();
                     setInterval(syncAdminData, 3000);
 
@@ -1742,7 +2026,7 @@ exports.handler = async (event) => {
                 <span>|</span>
                 <a href="/sub-logout" style="color:#ef4444;font-weight:bold;text-decoration:none;">Thoát (Nhường lượt)</a>
             </div>
-            ${getCustomerChatWidgetHTML('Đang dùng Studio')}
+            ${getCustomerChatWidgetHTML('Đang dùng Studio', initialCookieUid)}
             <script>
                 (function(){
                     let sec = ${remainSec};
